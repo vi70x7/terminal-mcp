@@ -10,7 +10,7 @@ const log = (msg) => process.stderr.write(`[smart-terminal-mcp] ${msg}\n`);
 export function createSandboxServer() {
   const server = new McpServer({
     name: 'smart-terminal-mcp',
-    version: '1.2.27',
+    version: '1.2.29',
   });
   const manager = new SessionManager();
   registerTools(server, manager);
@@ -22,7 +22,7 @@ async function main() {
   const manager = new SessionManager();
   const server = new McpServer({
     name: 'smart-terminal-mcp',
-    version: '1.2.27',
+    version: '1.2.29',
   });
   registerTools(server, manager);
 

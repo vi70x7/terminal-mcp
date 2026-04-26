@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "WebSearch",
-      "Bash(dir:*)"
+      "Bash(dir:*)",
+      "Bash(npm test:*)",
+      "Bash(\"C:\\\\Users\\\\Alessandro\\\\AppData\\\\Local\\\\mcp-publisher\\\\mcp-publisher.exe\" login:*)",
+      "Bash(node -e \"console.log\\(require\\('./package.json'\\).version\\)\")",
+      "Bash(npm view *)"
     ]
   }
 }

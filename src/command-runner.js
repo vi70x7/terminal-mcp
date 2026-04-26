@@ -26,11 +26,12 @@ export async function runCommand({
   successExitCode = 0,
   successFile,
   successFilePattern,
+  shell = false,
 }) {
   assertSuccessChecksAreValid({ successFile, successFilePattern });
   const resolvedCwd = resolvePath(cwd ?? process.cwd());
   const startedAt = Date.now();
-  const spawnPlan = buildSpawnPlan({ cmd, args, cwd: resolvedCwd });
+  const spawnPlan = buildSpawnPlan({ cmd, args, cwd: resolvedCwd, useShell: shell });
 
   return new Promise((resolve, reject) => {
     const stdoutChunks = [];
@@ -42,7 +43,7 @@ export async function runCommand({
 
     const child = spawn(spawnPlan.command, spawnPlan.args, {
       cwd: resolvedCwd,
-      shell: false,
+      shell: spawnPlan.shell ?? false,
       windowsHide: true,
       windowsVerbatimArguments: spawnPlan.windowsVerbatimArguments,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -222,7 +223,16 @@ function formatFileCheckError(error) {
   return error?.message ?? String(error);
 }
 
-function buildSpawnPlan({ cmd, args, cwd }) {
+function buildSpawnPlan({ cmd, args, cwd, useShell = false }) {
+  if (useShell) {
+    return {
+      command: cmd,
+      args,
+      shell: true,
+      windowsVerbatimArguments: false,
+    };
+  }
+
   if (process.platform !== 'win32') {
     return {
       command: cmd,
@@ -372,11 +382,11 @@ function quoteWindowsBatchArgument(value) {
 
 function formatStartError({ cmd, err }) {
   const baseMessage = `Failed to start command "${cmd}": ${err.message}`;
-  if (process.platform !== 'win32' || err?.code !== 'ENOENT' || looksLikePath(cmd)) {
+  if (err?.code !== 'ENOENT' || looksLikePath(cmd)) {
     return baseMessage;
   }
 
-  return `${baseMessage}. If this command should come from PATH, verify it is installed and visible to the server process. Shell built-ins such as dir or cd still require terminal_exec.`;
+  return `${baseMessage}. Verify it is installed and on PATH for the server process. For shell built-ins, pipes, or redirections, pass shell:true or use terminal_start + terminal_exec.`;
 }
 
 export function getStructuredParserHint({ cmd, args, ok, parseRequested, parsed, stdout }) {

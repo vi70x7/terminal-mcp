@@ -68,6 +68,55 @@ The main benefit is **model-context efficiency**, not guaranteed savings in the 
 
 In practice, this lets agents inspect terminal state more selectively instead of repeatedly dumping large logs back into the conversation.
 
+### Reducing tool definition overhead
+
+By default, the 8 most-used tools are registered with full schemas and 7 convenience tools are collected behind a single lightweight `terminal_extra` meta-tool (~30 tokens instead of ~1,500).
+
+**Default core tools**: `terminal_start`, `terminal_exec`, `terminal_run`, `terminal_read`, `terminal_write`, `terminal_wait`, `terminal_stop`, `terminal_list`
+
+**Default extra tools** (behind `terminal_extra`): `terminal_run_paged`, `terminal_retry`, `terminal_diff`, `terminal_resize`, `terminal_send_key`, `terminal_get_history`, `terminal_write_file`
+
+Extra tools are **not hidden** — the agent sees the tool names in the `terminal_extra` description and can:
+
+- **Discover schemas**: `terminal_extra({ list: true })` → returns full parameter schemas
+- **Call any extra tool**: `terminal_extra({ tool: "terminal_resize", args: { sessionId: "...", cols: 200, rows: 50 } })`
+
+Use `SMART_TERMINAL_DISABLED_TOOLS` to customize which tools are extra, or set it to an empty string to register all 15 tools with full schemas:
+
+**All tools with full schemas** (no meta-tool):
+
+```json
+{
+  "mcpServers": {
+    "smart-terminal": {
+      "command": "npx",
+      "args": ["-y", "smart-terminal-mcp@stable"],
+      "env": { "SMART_TERMINAL_DISABLED_TOOLS": "" }
+    }
+  }
+}
+```
+
+**Minimal setup** — only `terminal_exec` for simple command execution:
+
+```json
+"env": {
+  "SMART_TERMINAL_DISABLED_TOOLS": "terminal_run,terminal_run_paged,terminal_retry,terminal_diff,terminal_write_file,terminal_resize,terminal_send_key,terminal_get_history"
+}
+```
+
+5 core tools + `terminal_extra` holding 10 tools on demand.
+
+**Agent-focused setup** — `terminal_run` instead of `terminal_exec`:
+
+```json
+"env": {
+  "SMART_TERMINAL_DISABLED_TOOLS": "terminal_exec,terminal_diff,terminal_retry,terminal_resize,terminal_send_key,terminal_write,terminal_read,terminal_get_history"
+}
+```
+
+7 core tools + `terminal_extra` holding 8 tools on demand.
+
 ## Installation
 
 Recommended: run the stable release directly via `npx`:
@@ -134,6 +183,10 @@ If you want to pin an exact release instead of following the stable tag, replace
 
 ## Tools
 
+By default, 8 core tools are registered with full schemas and 7 convenience tools are available on demand via `terminal_extra` (see [Reducing tool definition overhead](#reducing-tool-definition-overhead)).
+
+### Core tools
+
 ### `terminal_start`
 
 Start a new interactive terminal session.
@@ -182,23 +235,6 @@ Run a one-shot non-interactive command using `cmd + args` with `shell=false`. Sa
 
 **Returns**: `ok`, `cmd`, `args`, `cwd`, `exitCode`, `timedOut`, `durationMs`, `stdout.raw`, `stdout.parsed`, optional `stdout.summary`, `stderr.raw`, optional `checks`, optional `hint`
 
-### `terminal_run_paged`
-
-Run a read-only one-shot command using `cmd + args` with `shell=false` and return a single page of stdout lines from the captured output. This pages the returned result instead of using head + tail truncation. Paged mode does not parse partial output, but it can return a concise summary for supported read-only commands when `summary: true`.
-
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| `cmd` | string | *required* | Read-only executable to run |
-| `args` | string[] | `[]` | Argument array passed directly to the executable |
-| `cwd` | string | server CWD | Working directory |
-| `timeout` | number | 30000 | Timeout in ms |
-| `maxOutputBytes` | number | 102400 | Max combined stdout/stderr bytes to capture |
-| `page` | number | 0 | 0-indexed page number |
-| `pageSize` | number | 100 | Lines per page |
-| `summary` | boolean | `false` | Return a concise summary when supported |
-
-**Returns**: Same envelope as `terminal_run`, plus `pageInfo.page`, `pageInfo.pageSize`, `pageInfo.totalLines`, `pageInfo.hasNext`
-
 ### `terminal_write`
 
 Write raw data to a terminal (for interactive programs). Follow with `terminal_read`.
@@ -221,32 +257,6 @@ Read buffered output with idle detection. Large outputs are truncated to head + 
 
 **Returns**: `output`, `timedOut`
 
-### `terminal_get_history`
-
-Retrieve past terminal output without consuming it. Non-destructive — returns historical output from a rolling buffer (last ~10,000 lines). Useful for reviewing output that was already read or missed.
-
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| `sessionId` | string | *required* | Session ID |
-| `offset` | number | 0 | Lines to skip from the end (0 = most recent). Use for pagination. |
-| `maxLines` | number | 200 | Max lines to return |
-| `format` | string | `"lines"` | Response format: `lines` or `text` |
-
-**Returns**: `lines` or `text`, plus `totalLines`, `returnedFrom`, `returnedTo`
-
-These defaults favor agent usability while still allowing tool callers to lower `maxLines` or `pageSize` explicitly when they want tighter responses.
-
-### `terminal_send_key`
-
-Send a named special key.
-
-| Param | Type | Description |
-|-------|------|-------------|
-| `sessionId` | string | Session ID |
-| `key` | string | Key name (see below) |
-
-**Supported keys**: `ctrl+c`, `ctrl+d`, `ctrl+z`, `ctrl+l`, `ctrl+a`, `ctrl+e`, `ctrl+u`, `ctrl+k`, `ctrl+w`, `tab`, `enter`, `escape`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `backspace`, `delete`, `f1`-`f12`
-
 ### `terminal_wait`
 
 Wait for a specific pattern in the output stream. By default, responses return only the last `tailLines`; use `returnMode: "full"` for the full matched output or `"match-only"` to suppress output entirely. If the MCP client sends a `progressToken`, long-running waits may also emit best-effort `notifications/progress` updates.
@@ -260,6 +270,79 @@ Wait for a specific pattern in the output stream. By default, responses return o
 | `tailLines` | number | 50 | Number of tail lines to return |
 
 **Returns**: `output`, `matched`, `timedOut` (`output` may be empty in `match-only` mode)
+
+### `terminal_stop`
+
+Stop and clean up a terminal session.
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `sessionId` | string | Session ID to stop |
+
+### `terminal_list`
+
+List all active terminal sessions.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `verbose` | boolean | `true` | Include full metadata |
+
+**Returns**: `sessions`, `count` (`verbose: false` returns `id`, `name`, `cwd`, `alive`, `busy` only)
+
+### Extra tools (via `terminal_extra`)
+
+The following tools are available by default through the `terminal_extra` meta-tool. The agent can discover their schemas via `terminal_extra({ list: true })` and call them via `terminal_extra({ tool: "<name>", args: { ... } })`.
+
+### `terminal_extra`
+
+Meta-tool for discovering and calling extra tools.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `list` | boolean | `false` | Return full parameter schemas for all extra tools |
+| `tool` | string | -- | Name of the extra tool to call |
+| `args` | object | -- | Arguments to pass to the extra tool |
+
+### `terminal_send_key`
+
+Send a named special key.
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `sessionId` | string | Session ID |
+| `key` | string | Key name (see below) |
+
+**Supported keys**: `ctrl+c`, `ctrl+d`, `ctrl+z`, `ctrl+l`, `ctrl+a`, `ctrl+e`, `ctrl+u`, `ctrl+k`, `ctrl+w`, `tab`, `enter`, `escape`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `backspace`, `delete`, `f1`-`f12`
+
+### `terminal_run_paged`
+
+Run a read-only one-shot command using `cmd + args` with `shell=false` and return a single page of stdout lines from the captured output. This pages the returned result instead of using head + tail truncation. Paged mode does not parse partial output, but it can return a concise summary for supported read-only commands when `summary: true`.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `cmd` | string | *required* | Read-only executable to run |
+| `args` | string[] | `[]` | Argument array passed directly to the executable |
+| `cwd` | string | server CWD | Working directory |
+| `timeout` | number | 30000 | Timeout in ms |
+| `maxOutputBytes` | number | 102400 | Max combined stdout/stderr bytes to capture |
+| `page` | number | 0 | 0-indexed page number |
+| `pageSize` | number | 100 | Lines per page |
+| `summary` | boolean | `false` | Return a concise summary when supported |
+
+**Returns**: Same envelope as `terminal_run`, plus `pageInfo.page`, `pageInfo.pageSize`, `pageInfo.totalLines`, `pageInfo.hasNext`
+
+### `terminal_get_history`
+
+Retrieve past terminal output without consuming it. Non-destructive — returns historical output from a rolling buffer (last ~10,000 lines). Useful for reviewing output that was already read or missed.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sessionId` | string | *required* | Session ID |
+| `offset` | number | 0 | Lines to skip from the end (0 = most recent). Use for pagination. |
+| `maxLines` | number | 200 | Max lines to return |
+| `format` | string | `"lines"` | Response format: `lines` or `text` |
+
+**Returns**: `lines` or `text`, plus `totalLines`, `returnedFrom`, `returnedTo`
 
 ### `terminal_retry`
 
@@ -304,14 +387,6 @@ Resize terminal dimensions.
 | `cols` | number | New width |
 | `rows` | number | New height |
 
-### `terminal_stop`
-
-Stop and clean up a terminal session.
-
-| Param | Type | Description |
-|-------|------|-------------|
-| `sessionId` | string | Session ID to stop |
-
 ### `terminal_write_file`
 
 Write content directly to a file on disk. Resolves paths relative to the session's CWD. Safer and more robust than piping content through `echo` — handles special characters, newlines, and large files correctly.
@@ -325,16 +400,6 @@ Write content directly to a file on disk. Resolves paths relative to the session
 | `append` | boolean | `false` | Append to file instead of overwriting |
 
 **Returns**: `success`, `path` (absolute), `size` (bytes), `append`
-
-### `terminal_list`
-
-List all active terminal sessions.
-
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| `verbose` | boolean | `true` | Include full metadata |
-
-**Returns**: `sessions`, `count` (`verbose: false` returns `id`, `name`, `cwd`, `alive`, `busy` only)
 
 ## Usage Examples
 

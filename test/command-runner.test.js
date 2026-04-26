@@ -288,18 +288,13 @@ test('runCommand handles explicit command paths with spaces', async () => {
   }
 });
 
-test('runCommand adds a helpful ENOENT hint on Windows for PATH commands', async (t) => {
-  if (process.platform !== 'win32') {
-    t.skip('Windows-only behavior');
-    return;
-  }
-
+test('runCommand adds a helpful ENOENT hint for PATH commands', async () => {
   await assert.rejects(
     runCommand({
       cmd: '__smart_terminal_missing_command__',
       parse: false,
     }),
-    /verify it is installed and visible to the server process/
+    /pass shell:true or use terminal_start \+ terminal_exec/
   );
 });
 

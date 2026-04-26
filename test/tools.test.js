@@ -65,27 +65,29 @@ test('tools source does not pretty-print JSON responses', async () => {
 });
 
 test('tool metadata stays concise', () => {
-  const server = createFakeServer();
-
-  registerTools(server, {});
-
-  for (const [name, { description, schema }] of server.tools) {
-    assert.ok(description.length <= 70, `${name} description is too long`);
-    assert.doesNotMatch(description, /Supported keys:/);
-
-    for (const [fieldName, fieldSchema] of Object.entries(schema)) {
-      const fieldDescription = getDescription(fieldSchema);
-      assert.ok(fieldDescription.length <= 30, `${name}.${fieldName} description is too long`);
-      assert.doesNotMatch(fieldDescription, /\(default:|e\.g\.|Defaults to|such as/i);
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
+    const server = createFakeServer();
+    registerTools(server, {});
+    for (const [name, { description, schema }] of server.tools) {
+      assert.ok(description.length <= 70, `${name} description is too long`);
+      assert.doesNotMatch(description, /Supported keys:/);
+      for (const [fieldName, fieldSchema] of Object.entries(schema)) {
+        const fieldDescription = getDescription(fieldSchema);
+        assert.ok(fieldDescription.length <= 30, `${name}.${fieldName} description is too long`);
+        assert.doesNotMatch(fieldDescription, /\(default:|e\.g\.|Defaults to|such as/i);
+      }
     }
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
   }
 });
 
 test('tool schemas keep agent-friendly default output sizes', () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
   const server = createFakeServer();
-
   registerTools(server, {});
-
   assert.deepEqual({
     terminalExecMaxLines: server.tools.get('terminal_exec').schema.maxLines.parse(undefined),
     terminalReadMaxLines: server.tools.get('terminal_read').schema.maxLines.parse(undefined),
@@ -109,6 +111,9 @@ test('tool schemas keep agent-friendly default output sizes', () => {
     terminalRunPagedSummary: false,
     terminalListVerbose: true,
   });
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
 });
 
 test('terminal_start returns compact session metadata', async () => {
@@ -167,8 +172,74 @@ test('terminal_start stops a created session when banner startup fails', async (
   const result = await server.tools.get('terminal_start').handler({});
   assert.ok(result.isError, 'expected isError to be true');
   assert.match(result.content[0].text, /banner failed/);
-  assert.match(result.content[0].text, /call terminal_start with NO shell parameter/i);
+  // Hint only appears when shell was explicitly provided; this test passes no shell.
+  assert.doesNotMatch(result.content[0].text, /call terminal_start with NO shell parameter/i);
   assert.deepEqual(stopCalls, ['s1']);
+});
+
+test('SMART_TERMINAL_DISABLED_TOOLS moves tools behind terminal_extra', async () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = 'terminal_diff, terminal_retry';
+  try {
+    const server = createFakeServer();
+    registerTools(server, {});
+    // Disabled tools are NOT registered individually
+    assert.ok(!server.tools.has('terminal_diff'), 'terminal_diff should not be a standalone tool');
+    assert.ok(!server.tools.has('terminal_retry'), 'terminal_retry should not be a standalone tool');
+    // Enabled tools still work
+    assert.ok(server.tools.has('terminal_run'), 'terminal_run should be present');
+    assert.ok(server.tools.has('terminal_list'), 'terminal_list should be present');
+    // Meta-tool is registered
+    assert.ok(server.tools.has('terminal_extra'), 'terminal_extra should be present');
+    assert.match(server.tools.get('terminal_extra').description, /terminal_diff/);
+    assert.match(server.tools.get('terminal_extra').description, /terminal_retry/);
+    // list=true returns catalog
+    const listResult = await server.tools.get('terminal_extra').handler({ list: true });
+    const catalog = JSON.parse(listResult.content[0].text);
+    assert.ok(catalog.terminal_diff, 'catalog should contain terminal_diff');
+    assert.ok(catalog.terminal_retry, 'catalog should contain terminal_retry');
+    assert.ok(catalog.terminal_diff.parameters, 'should include parameter schemas');
+    // Unknown tool returns error
+    const badResult = await server.tools.get('terminal_extra').handler({ tool: 'nope', args: {} });
+    assert.ok(badResult.isError, 'unknown tool should return isError');
+    // Validation error returns helpful message
+    const valResult = await server.tools.get('terminal_extra').handler({ tool: 'terminal_diff', args: { timeout: 'not-a-number' } });
+    assert.ok(valResult.isError, 'bad args should return isError');
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
+});
+
+test('default: convenience tools behind terminal_extra', () => {
+  delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  const server = createFakeServer();
+  registerTools(server, {});
+  // Core tools registered normally
+  assert.ok(server.tools.has('terminal_start'), 'terminal_start is core');
+  assert.ok(server.tools.has('terminal_exec'), 'terminal_exec is core');
+  assert.ok(server.tools.has('terminal_run'), 'terminal_run is core');
+  assert.ok(server.tools.has('terminal_read'), 'terminal_read is core');
+  assert.ok(server.tools.has('terminal_write'), 'terminal_write is core');
+  assert.ok(server.tools.has('terminal_wait'), 'terminal_wait is core');
+  assert.ok(server.tools.has('terminal_stop'), 'terminal_stop is core');
+  assert.ok(server.tools.has('terminal_list'), 'terminal_list is core');
+  // Convenience tools behind terminal_extra
+  assert.ok(server.tools.has('terminal_extra'), 'terminal_extra should exist by default');
+  assert.ok(!server.tools.has('terminal_diff'), 'terminal_diff is extra by default');
+  assert.ok(!server.tools.has('terminal_retry'), 'terminal_retry is extra by default');
+  assert.ok(!server.tools.has('terminal_resize'), 'terminal_resize is extra by default');
+});
+
+test('SMART_TERMINAL_DISABLED_TOOLS="" registers all tools normally', () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
+    const server = createFakeServer();
+    registerTools(server, {});
+    assert.ok(!server.tools.has('terminal_extra'), 'no meta-tool when all enabled');
+    assert.ok(server.tools.has('terminal_diff'), 'terminal_diff registered normally');
+    assert.ok(server.tools.has('terminal_retry'), 'terminal_retry registered normally');
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
 });
 
 test('terminal_run forwards summary mode for concise output', async () => {
@@ -217,6 +288,36 @@ test('terminal_run can re-evaluate success from a file pattern', async () => {
   }
 });
 
+test('terminal_run shell=true executes commands via the system shell', async () => {
+  const server = createFakeServer();
+  registerTools(server, {});
+
+  const result = await server.tools.get('terminal_run').handler({
+    cmd: 'echo shell-ok',
+    args: [],
+    shell: true,
+    parse: false,
+  });
+
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(payload.ok, true);
+  assert.match(payload.stdout.raw, /shell-ok/);
+});
+
+test('terminal_run ENOENT error hints at shell=true and terminal_exec fallback', async () => {
+  const server = createFakeServer();
+  registerTools(server, {});
+
+  await assert.rejects(
+    () => server.tools.get('terminal_run').handler({
+      cmd: 'smart-terminal-missing-binary-xyz',
+      args: [],
+      parse: false,
+    }),
+    /shell:true or use terminal_start \+ terminal_exec/
+  );
+});
+
 test('terminal_read rejects idleTimeout values that are not less than timeout', async () => {
   const server = createFakeServer();
   let getCalls = 0;
@@ -241,55 +342,65 @@ test('terminal_read rejects idleTimeout values that are not less than timeout', 
 });
 
 test('terminal_run_paged can return summaries for read-only commands', async () => {
-  const server = createFakeServer();
-  const lookupCommand = process.platform === 'win32' ? 'where' : 'which';
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
+    const server = createFakeServer();
+    const lookupCommand = process.platform === 'win32' ? 'where' : 'which';
 
-  registerTools(server, {});
+    registerTools(server, {});
 
-  const result = await server.tools.get('terminal_run_paged').handler({
-    cmd: lookupCommand,
-    args: [lookupCommand],
-    page: 0,
-    pageSize: 5,
-    summary: true,
-  });
+    const result = await server.tools.get('terminal_run_paged').handler({
+      cmd: lookupCommand,
+      args: [lookupCommand],
+      page: 0,
+      pageSize: 5,
+      summary: true,
+    });
 
-  const payload = JSON.parse(result.content[0].text);
-  assert.equal(payload.stdout.raw, '');
-  assert.equal(payload.stdout.parsed, null);
-  assert.ok(payload.stdout.summary.pathCount > 0);
-  assert.ok(payload.pageInfo.totalLines > 0);
+    const payload = JSON.parse(result.content[0].text);
+    assert.equal(payload.stdout.raw, '');
+    assert.equal(payload.stdout.parsed, null);
+    assert.ok(payload.stdout.summary.pathCount > 0);
+    assert.ok(payload.pageInfo.totalLines > 0);
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
 });
 
 test('terminal_get_history forwards format and returns text payloads', async () => {
-  const server = createFakeServer();
-  const historyCalls = [];
-  const manager = {
-    get: () => ({
-      getHistory: (opts) => {
-        historyCalls.push(opts);
-        return { text: 'line 2\nline 3', totalLines: 3, returnedFrom: 1, returnedTo: 3 };
-      },
-    }),
-  };
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
+    const server = createFakeServer();
+    const historyCalls = [];
+    const manager = {
+      get: () => ({
+        getHistory: (opts) => {
+          historyCalls.push(opts);
+          return { text: 'line 2\nline 3', totalLines: 3, returnedFrom: 1, returnedTo: 3 };
+        },
+      }),
+    };
 
-  registerTools(server, manager);
+    registerTools(server, manager);
 
-  const result = await server.tools.get('terminal_get_history').handler({
-    sessionId: 's1',
-    offset: 0,
-    maxLines: 2,
-    format: 'text',
-  });
+    const result = await server.tools.get('terminal_get_history').handler({
+      sessionId: 's1',
+      offset: 0,
+      maxLines: 2,
+      format: 'text',
+    });
 
-  assert.deepEqual(historyCalls, [{ offset: 0, limit: 2, format: 'text' }]);
-  assert.deepEqual(JSON.parse(result.content[0].text), {
-    sessionId: 's1',
-    text: 'line 2\nline 3',
-    totalLines: 3,
-    returnedFrom: 1,
-    returnedTo: 3,
-  });
+    assert.deepEqual(historyCalls, [{ offset: 0, limit: 2, format: 'text' }]);
+    assert.deepEqual(JSON.parse(result.content[0].text), {
+      sessionId: 's1',
+      text: 'line 2\nline 3',
+      totalLines: 3,
+      returnedFrom: 1,
+      returnedTo: 3,
+    });
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
 });
 
 test('terminal_wait forwards returnMode and tailLines', async () => {
@@ -337,6 +448,8 @@ test('terminal_wait forwards returnMode and tailLines', async () => {
 });
 
 test('terminal_retry returns retry results as compact JSON', async () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
   const server = createFakeServer();
   let calls = 0;
   const manager = {
@@ -370,9 +483,14 @@ test('terminal_retry returns retry results as compact JSON', async () => {
     lastResult: { output: 'ok', exitCode: 0, cwd: 'C:/repo', timedOut: false },
     history: [{ attempt: 1, output: 'ok', exitCode: 0, cwd: 'C:/repo', timedOut: false }],
   });
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
 });
 
 test('terminal_diff returns diff results as compact JSON', async () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
   const server = createFakeServer();
   const execCalls = [];
   const manager = {
@@ -405,4 +523,7 @@ test('terminal_diff returns diff results as compact JSON', async () => {
   assert.equal(payload.identical, false);
   assert.match(payload.diff, /--- type before.txt/);
   assert.match(payload.diff, /\+\+\+ type after.txt/);
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
 });

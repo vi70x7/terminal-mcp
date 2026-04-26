@@ -48,6 +48,16 @@ function runCommand(command, errorMessage, extraEnv = {}) {
   }
 }
 
+function parseFlags(args) {
+  const flags = new Set();
+  const positional = [];
+  for (const arg of args) {
+    if (arg.startsWith('--')) flags.add(arg);
+    else positional.push(arg);
+  }
+  return { flags, positional };
+}
+
 function createServerCardReaderInit() {
   return parseExpression(
     `JSON.parse(readFileSync(new URL('${SERVER_CARD_FILE_URL}', import.meta.url), 'utf8'))`,
@@ -297,7 +307,7 @@ async function discoverTools() {
     const child = spawn('node', ['src/index.js'], {
       cwd: ROOT,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, SMITHERY_SCAN: '1' },
+      env: process.env,
     });
 
     let buffer = '';
@@ -510,10 +520,16 @@ function updateVersionFiles(nextVersion) {
 }
 
 export async function main(args = process.argv.slice(2)) {
+  const { flags, positional } = parseFlags(args);
+  const skipNpm = flags.has('--skip-npm');
+  const skipRegistry = flags.has('--skip-registry');
+  const skipSmithery = flags.has('--skip-smithery');
+
   let fileSnapshots = null;
+  let npmPublished = false;
 
   try {
-    const versionArg = args[0] || 'patch';
+    const versionArg = positional[0] || 'patch';
     const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
     const currentVersion = pkg.version;
     const nextVersion = bumpVersion(currentVersion, versionArg);
@@ -529,23 +545,55 @@ export async function main(args = process.argv.slice(2)) {
     updateServerCard(tools, nextVersion);
 
     // ── Step 3: npm ──
-    console.log('\n📦 Phase 1: Publishing to npm...');
-    runCommand('npm publish --access public', 'npm publishing failed.');
+    if (skipNpm) {
+      console.log('\n📦 Phase 1: Publishing to npm... SKIPPED (--skip-npm)');
+    } else {
+      console.log('\n📦 Phase 1: Publishing to npm...');
+      runCommand('npm publish --access public', 'npm publishing failed.');
+      npmPublished = true;
+    }
 
     // ── Step 4: Official MCP Registry ──
-    console.log('\n🌍 Phase 2: Publishing to Official MCP Registry...');
-    runCommand(`${getMcpPublisher()} publish`, 'Official MCP Registry publishing failed.');
+    if (skipRegistry) {
+      console.log('\n🌍 Phase 2: Publishing to Official MCP Registry... SKIPPED (--skip-registry)');
+    } else {
+      console.log('\n🌍 Phase 2: Publishing to Official MCP Registry...');
+      try {
+        runCommand(`${getMcpPublisher()} publish`, 'Official MCP Registry publishing failed.');
+      } catch (error) {
+        const causeStderr = error.cause?.stderr?.toString?.() ?? '';
+        const causeMessage = error.message ?? '';
+        if (causeStderr.includes('401') || causeStderr.includes('Unauthorized') || causeStderr.includes('expired')
+          || causeMessage.includes('401') || causeMessage.includes('Unauthorized') || causeMessage.includes('expired')) {
+          const pub = getMcpPublisher();
+          console.error(`\n💡 Auth token expired. Run: ${pub} login github`);
+          console.error(`   Then retry with: npm run release -- ${versionArg} --skip-npm`);
+        }
+        throw error;
+      }
+    }
 
     // ── Step 5: Smithery.ai (HTTP server + tunnel + publish) ──
-    await publishToSmithery();
+    if (skipSmithery) {
+      console.log('\n💎 Phase 3: Publishing to Smithery.ai... SKIPPED (--skip-smithery)');
+    } else {
+      await publishToSmithery();
+    }
 
-    console.log(`\n✅ SUCCESSFULLY PUBLISHED version ${nextVersion} to all registries!`);
+    const skipped = [skipNpm && 'npm', skipRegistry && 'registry', skipSmithery && 'smithery'].filter(Boolean);
+    const suffix = skipped.length ? ` (skipped: ${skipped.join(', ')})` : ' to all registries';
+    console.log(`\n✅ SUCCESSFULLY PUBLISHED version ${nextVersion}${suffix}!`);
   } catch (error) {
     console.error('\n❌ Publish failed.');
     console.error(error);
     if (fileSnapshots) {
-      // Restore only files this script manages so unrelated local edits stay intact.
-      revertVersionChanges(fileSnapshots);
+      if (npmPublished) {
+        // npm already has this version — don't revert local files or we'll get version drift.
+        console.error('\n⚠️  npm was already published. Local version files kept at the new version.');
+        console.error('   Fix the issue and re-run with --skip-npm to complete remaining phases.');
+      } else {
+        revertVersionChanges(fileSnapshots);
+      }
     }
     throw error;
   }

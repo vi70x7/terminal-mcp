@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { zodToJsonSchema } from 'zod-to-json-schema';
 import { writeFile, appendFile, mkdir } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
 import { DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_MS, runCommand } from './command-runner.js';
@@ -72,17 +73,30 @@ function assertReadTimeouts(timeout, idleTimeout) {
  * @param {import('./session-manager.js').SessionManager} manager
  */
 export function registerTools(server, manager) {
+  const DEFAULT_EXTRA = 'terminal_run_paged,terminal_retry,terminal_diff,terminal_resize,terminal_send_key,terminal_get_history,terminal_write_file';
+  const _off = new Set(
+    (process.env.SMART_TERMINAL_DISABLED_TOOLS ?? DEFAULT_EXTRA).split(',').map(s => s.trim()).filter(Boolean)
+  );
+  const _extras = new Map();
+  const tool = (name, desc, schema, handler) => {
+    if (_off.has(name)) {
+      _extras.set(name, { description: desc, schema, handler });
+      return;
+    }
+    server.tool(name, desc, schema, handler);
+  };
+
   // --- terminal_start ---
-  server.tool(
+  tool(
     'terminal_start',
     'Start a terminal session. Auto-detects shell if omitted.',
     {
-      shell: z.string().optional().describe('Shell to use; omit to detect'),
-      cols: z.number().int().min(20).max(500).default(120).describe('Terminal width in columns'),
-      rows: z.number().int().min(5).max(200).default(30).describe('Terminal height in rows'),
-      cwd: z.string().optional().describe('Working directory'),
-      name: z.string().optional().describe('Session name'),
-      env: z.record(z.string()).optional().describe('Environment variables'),
+      shell: z.string().optional(),
+      cols: z.number().int().min(20).max(500).default(120),
+      rows: z.number().int().min(5).max(200).default(30),
+      cwd: z.string().optional(),
+      name: z.string().optional(),
+      env: z.record(z.string()).optional(),
     },
     async ({ shell, cols, rows, cwd, name, env }) => {
       let session;
@@ -113,14 +127,14 @@ export function registerTools(server, manager) {
   );
 
   // --- terminal_exec ---
-  server.tool(
+  tool(
     'terminal_exec',
-    'Execute a command in a terminal session and wait for it to finish.',
+    'Run a command in a session and wait for completion.',
     {
-      sessionId: z.string().describe('Session ID'),
-      command: z.string().describe('Command to execute'),
-      timeout: z.number().int().min(1000).max(600000).default(30000).describe('Timeout in ms'),
-      maxLines: z.number().int().min(10).max(10000).default(DEFAULT_EXEC_MAX_LINES).describe('Max output lines'),
+      sessionId: z.string(),
+      command: z.string(),
+      timeout: z.number().int().min(1000).max(600000).default(30000),
+      maxLines: z.number().int().min(10).max(10000).default(DEFAULT_EXEC_MAX_LINES),
     },
     async ({ sessionId, command, timeout, maxLines }, extra) => {
       const session = manager.get(sessionId);
@@ -136,23 +150,24 @@ export function registerTools(server, manager) {
   );
 
   // --- terminal_run ---
-  server.tool(
+  tool(
     'terminal_run',
-    'Run a binary directly; avoid shell quoting.',
+    'Run a binary directly. shell=true for built-ins/pipes/redirects.',
     {
-      cmd: z.string().describe('Executable path or name'),
-      args: z.array(z.string()).default([]).describe('Args passed verbatim'),
-      cwd: z.string().optional().describe('Working directory'),
-      timeout: z.number().int().min(1000).max(600000).default(DEFAULT_TIMEOUT_MS).describe('Timeout in ms'),
-      maxOutputBytes: z.number().int().min(1024).max(1048576).default(DEFAULT_MAX_OUTPUT_BYTES).describe('Max output bytes'),
+      cmd: z.string(),
+      args: z.array(z.string()).default([]),
+      cwd: z.string().optional(),
+      timeout: z.number().int().min(1000).max(600000).default(DEFAULT_TIMEOUT_MS),
+      maxOutputBytes: z.number().int().min(1024).max(1048576).default(DEFAULT_MAX_OUTPUT_BYTES),
       parse: z.boolean().default(true).describe('Parse structured output'),
-      parseOnly: z.boolean().default(false).describe('Drop raw when parsed'),
-      summary: z.boolean().default(false).describe('Return concise summary'),
-      successExitCode: z.number().int().nullable().default(0).describe('Required exit code'),
-      successFile: z.string().optional().describe('File checked for success'),
-      successFilePattern: z.string().optional().describe('Regex for success file'),
+      parseOnly: z.boolean().default(false).describe('Omit raw when parsed'),
+      summary: z.boolean().default(false),
+      successExitCode: z.number().int().nullable().default(0).describe('null=any'),
+      successFile: z.string().optional(),
+      successFilePattern: z.string().optional().describe('Regex'),
+      shell: z.boolean().default(false).describe('Run via system shell'),
     },
-    async ({ cmd, args, cwd, timeout, maxOutputBytes, parse, parseOnly, summary, successExitCode, successFile, successFilePattern }) => {
+    async ({ cmd, args, cwd, timeout, maxOutputBytes, parse, parseOnly, summary, successExitCode, successFile, successFilePattern, shell }) => {
       const result = await runCommand({
         cmd,
         args,
@@ -165,24 +180,25 @@ export function registerTools(server, manager) {
         successExitCode,
         successFile,
         successFilePattern,
+        shell,
       });
       return jsonContent(result);
     }
   );
 
   // --- terminal_run_paged ---
-  server.tool(
+  tool(
     'terminal_run_paged',
     'Run a read-only command and return one page of output.',
     {
-      cmd: z.string().describe('Executable'),
-      args: z.array(z.string()).default([]).describe('Arguments'),
-      cwd: z.string().optional().describe('Working directory'),
-      timeout: z.number().int().min(1000).max(600000).default(DEFAULT_TIMEOUT_MS).describe('Timeout in ms'),
-      maxOutputBytes: z.number().int().min(1024).max(1048576).default(DEFAULT_MAX_OUTPUT_BYTES).describe('Max output bytes'),
-      page: z.number().int().min(0).default(0).describe('Page number'),
-      pageSize: z.number().int().min(1).max(1000).default(DEFAULT_PAGE_SIZE).describe('Page size'),
-      summary: z.boolean().default(false).describe('Return concise summary'),
+      cmd: z.string(),
+      args: z.array(z.string()).default([]),
+      cwd: z.string().optional(),
+      timeout: z.number().int().min(1000).max(600000).default(DEFAULT_TIMEOUT_MS),
+      maxOutputBytes: z.number().int().min(1024).max(1048576).default(DEFAULT_MAX_OUTPUT_BYTES),
+      page: z.number().int().min(0).default(0),
+      pageSize: z.number().int().min(1).max(1000).default(DEFAULT_PAGE_SIZE),
+      summary: z.boolean().default(false),
     },
     async ({ cmd, args, cwd, timeout, maxOutputBytes, page, pageSize, summary }) => {
       assertPagedCommandIsReadOnly(cmd, args);
@@ -218,12 +234,12 @@ export function registerTools(server, manager) {
   );
 
   // --- terminal_write ---
-  server.tool(
+  tool(
     'terminal_write',
     'Write raw data to a terminal session.',
     {
-      sessionId: z.string().describe('Session ID'),
-      data: z.string().describe('Data to write'),
+      sessionId: z.string(),
+      data: z.string(),
     },
     async ({ sessionId, data }) => {
       const session = manager.get(sessionId);
@@ -238,14 +254,14 @@ export function registerTools(server, manager) {
   );
 
   // --- terminal_read ---
-  server.tool(
+  tool(
     'terminal_read',
     'Read new output from a terminal session.',
     {
-      sessionId: z.string().describe('Session ID'),
-      timeout: z.number().int().min(500).max(300000).default(30000).describe('Hard timeout ms; > idleTimeout'),
-      idleTimeout: z.number().int().min(100).max(10000).default(500).describe('Idle timeout ms; < timeout'),
-      maxLines: z.number().int().min(10).max(10000).default(DEFAULT_READ_MAX_LINES).describe('Max output lines'),
+      sessionId: z.string(),
+      timeout: z.number().int().min(500).max(300000).default(30000),
+      idleTimeout: z.number().int().min(100).max(10000).default(500).describe('Must be < timeout'),
+      maxLines: z.number().int().min(10).max(10000).default(DEFAULT_READ_MAX_LINES),
     },
     async ({ sessionId, timeout, idleTimeout, maxLines }) => {
       assertReadTimeouts(timeout, idleTimeout);
@@ -256,14 +272,14 @@ export function registerTools(server, manager) {
   );
 
   // --- terminal_get_history ---
-  server.tool(
+  tool(
     'terminal_get_history',
     'Get past output from a terminal session.',
     {
-      sessionId: z.string().describe('Session ID'),
-      offset: z.number().int().min(0).default(0).describe('History offset'),
-      maxLines: z.number().int().min(1).max(10000).default(DEFAULT_HISTORY_LIMIT).describe('Max lines to return'),
-      format: z.enum(['lines', 'text']).default(DEFAULT_HISTORY_FORMAT).describe('History format'),
+      sessionId: z.string(),
+      offset: z.number().int().min(0).default(0),
+      maxLines: z.number().int().min(1).max(10000).default(DEFAULT_HISTORY_LIMIT),
+      format: z.enum(['lines', 'text']).default(DEFAULT_HISTORY_FORMAT),
     },
     async ({ sessionId, offset, maxLines, format }) => {
       const session = manager.get(sessionId);
@@ -273,13 +289,13 @@ export function registerTools(server, manager) {
   );
 
   // --- terminal_resize ---
-  server.tool(
+  tool(
     'terminal_resize',
     'Resize terminal dimensions.',
     {
-      sessionId: z.string().describe('Session ID'),
-      cols: z.number().int().min(20).max(500).describe('New width in columns'),
-      rows: z.number().int().min(5).max(200).describe('New height in rows'),
+      sessionId: z.string(),
+      cols: z.number().int().min(20).max(500),
+      rows: z.number().int().min(5).max(200),
     },
     async ({ sessionId, cols, rows }) => {
       const session = manager.get(sessionId);
@@ -289,12 +305,12 @@ export function registerTools(server, manager) {
   );
 
   // --- terminal_send_key ---
-  server.tool(
+  tool(
     'terminal_send_key',
-    'Send a key to the terminal.',
+    'Send a special key (Enter, Tab, Escape, Ctrl-C etc.).',
     {
-      sessionId: z.string().describe('Session ID'),
-      key: z.string().describe('Key name'),
+      sessionId: z.string(),
+      key: z.string(),
     },
     async ({ sessionId, key }) => {
       const session = manager.get(sessionId);
@@ -304,15 +320,15 @@ export function registerTools(server, manager) {
   );
 
   // --- terminal_wait ---
-  server.tool(
+  tool(
     'terminal_wait',
     'Wait for a pattern to appear in terminal output.',
     {
-      sessionId: z.string().describe('Session ID'),
-      pattern: z.string().describe('Pattern'),
-      timeout: z.number().int().min(1000).max(600000).default(30000).describe('Timeout in ms'),
-      returnMode: z.enum(['tail', 'full', 'match-only']).default('tail').describe('Return mode'),
-      tailLines: z.number().int().min(1).max(1000).default(50).describe('Tail lines'),
+      sessionId: z.string(),
+      pattern: z.string(),
+      timeout: z.number().int().min(1000).max(600000).default(30000),
+      returnMode: z.enum(['tail', 'full', 'match-only']).default('tail'),
+      tailLines: z.number().int().min(1).max(1000).default(50),
     },
     async ({ sessionId, pattern, timeout, returnMode, tailLines }, extra) => {
       const session = manager.get(sessionId);
@@ -329,19 +345,19 @@ export function registerTools(server, manager) {
   );
 
   // --- terminal_retry ---
-  server.tool(
+  tool(
     'terminal_retry',
     'Retry a command with backoff.',
     {
-      sessionId: z.string().describe('Session ID'),
-      command: z.string().describe('Command'),
-      maxRetries: z.number().int().min(0).max(10).default(3).describe('Retry count'),
-      backoff: z.enum(['fixed', 'exponential', 'linear']).default('exponential').describe('Backoff mode'),
-      delayMs: z.number().int().min(10).max(60000).default(1000).describe('Delay in ms'),
-      timeout: z.number().int().min(1000).max(600000).default(30000).describe('Timeout in ms'),
-      maxLines: z.number().int().min(10).max(10000).default(DEFAULT_EXEC_MAX_LINES).describe('Max output lines'),
-      successExitCode: z.number().int().nullable().default(0).describe('Success exit code'),
-      successPattern: z.string().nullable().default(null).describe('Output regex'),
+      sessionId: z.string(),
+      command: z.string(),
+      maxRetries: z.number().int().min(0).max(10).default(3),
+      backoff: z.enum(['fixed', 'exponential', 'linear']).default('exponential'),
+      delayMs: z.number().int().min(10).max(60000).default(1000),
+      timeout: z.number().int().min(1000).max(600000).default(30000),
+      maxLines: z.number().int().min(10).max(10000).default(DEFAULT_EXEC_MAX_LINES),
+      successExitCode: z.number().int().nullable().default(0).describe('null=any'),
+      successPattern: z.string().nullable().default(null).describe('Regex'),
     },
     async ({ sessionId, command, maxRetries, backoff, delayMs, timeout, maxLines, successExitCode, successPattern }) => {
       const session = manager.get(sessionId);
@@ -360,16 +376,16 @@ export function registerTools(server, manager) {
   );
 
   // --- terminal_diff ---
-  server.tool(
+  tool(
     'terminal_diff',
     'Run two commands and return a unified diff.',
     {
-      sessionId: z.string().describe('Session ID'),
-      commandA: z.string().describe('Baseline command'),
-      commandB: z.string().describe('Comparison command'),
-      timeout: z.number().int().min(1000).max(600000).default(30000).describe('Timeout in ms'),
-      maxLines: z.number().int().min(10).max(10000).default(DEFAULT_EXEC_MAX_LINES).describe('Max output lines'),
-      contextLines: z.number().int().min(0).max(20).default(3).describe('Diff context lines'),
+      sessionId: z.string(),
+      commandA: z.string(),
+      commandB: z.string(),
+      timeout: z.number().int().min(1000).max(600000).default(30000),
+      maxLines: z.number().int().min(10).max(10000).default(DEFAULT_EXEC_MAX_LINES),
+      contextLines: z.number().int().min(0).max(20).default(3),
     },
     async ({ sessionId, commandA, commandB, timeout, maxLines, contextLines }) => {
       const session = manager.get(sessionId);
@@ -379,11 +395,11 @@ export function registerTools(server, manager) {
   );
 
   // --- terminal_stop ---
-  server.tool(
+  tool(
     'terminal_stop',
-    'Stop and clean up a terminal session.',
+    'Stop a terminal session.',
     {
-      sessionId: z.string().describe('Session ID to stop'),
+      sessionId: z.string(),
     },
     async ({ sessionId }) => {
       manager.stop(sessionId);
@@ -392,11 +408,11 @@ export function registerTools(server, manager) {
   );
 
   // --- terminal_list ---
-  server.tool(
+  tool(
     'terminal_list',
     'List active terminal sessions.',
     {
-      verbose: z.boolean().default(true).describe('Include full metadata'),
+      verbose: z.boolean().default(true),
     },
     async ({ verbose = true }) => {
       const sessions = manager.list({ verbose });
@@ -405,15 +421,15 @@ export function registerTools(server, manager) {
   );
 
   // --- terminal_write_file ---
-  server.tool(
+  tool(
     'terminal_write_file',
     'Write content to a file.',
     {
-      sessionId: z.string().describe('Session ID'),
-      path: z.string().describe('File path'),
-      content: z.string().describe('File content'),
-      encoding: z.enum(['utf-8', 'ascii', 'base64', 'hex', 'latin1']).default('utf-8').describe('File encoding'),
-      append: z.boolean().default(false).describe('Append mode'),
+      sessionId: z.string(),
+      path: z.string(),
+      content: z.string(),
+      encoding: z.enum(['utf-8', 'ascii', 'base64', 'hex', 'latin1']).default('utf-8'),
+      append: z.boolean().default(false),
     },
     async ({ sessionId, path: filePath, content, encoding, append }) => {
       const session = manager.get(sessionId);
@@ -441,4 +457,41 @@ export function registerTools(server, manager) {
       });
     }
   );
+
+  // --- terminal_extra (meta-tool for disabled tools) ---
+  if (_extras.size > 0) {
+    const names = [..._extras.keys()].join(', ');
+    server.tool(
+      'terminal_extra',
+      `${_extras.size} more tools: ${names}. list=true for full schemas, or pass tool + args to call.`,
+      {
+        list: z.boolean().default(false),
+        tool: z.string().optional(),
+        args: z.record(z.any()).optional(),
+      },
+      async (params, extra) => {
+        if (params.list || !params.tool) {
+          const catalog = {};
+          for (const [n, def] of _extras) {
+            const s = zodToJsonSchema(z.object(def.schema));
+            catalog[n] = { description: def.description, parameters: s.properties || {}, required: s.required || [] };
+          }
+          return jsonContent(catalog);
+        }
+
+        const def = _extras.get(params.tool);
+        if (!def) return errorContent(`Unknown tool "${params.tool}". Available: ${names}`);
+
+        try {
+          const validated = z.object(def.schema).parse(params.args || {});
+          return await def.handler(validated, extra);
+        } catch (err) {
+          if (err instanceof z.ZodError) {
+            return errorContent(`Invalid args for ${params.tool}: ${err.errors.map(e => `${e.path.join('.')}: ${e.message}`).join('; ')}`);
+          }
+          throw err;
+        }
+      }
+    );
+  }
 }

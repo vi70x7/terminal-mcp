@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.35] - 2026-04-26
+
+### Added
+- **`terminal_extra` meta-tool**: Convenience tools (`terminal_run_paged`, `terminal_retry`, `terminal_diff`, `terminal_resize`, `terminal_send_key`, `terminal_get_history`, `terminal_write_file`) are now collected behind a single lightweight meta-tool by default, reducing tool definition token overhead by ~50%. The agent can discover schemas via `list: true` and call any extra tool through `terminal_extra`.
+- **`SMART_TERMINAL_DISABLED_TOOLS` env var**: Customize which tools are moved behind `terminal_extra`. Set to empty string to register all 15 tools with full schemas.
+
+### Changed
+- Stripped redundant `.describe()` calls from tool parameter schemas where the parameter name is self-documenting (e.g. `sessionId`, `command`, `cwd`, `timeout`). Keeps only 6 essential descriptions for non-obvious parameters.
+
+### Fixed
+- Fixed `pty-session` to properly track pending markers and allow smooth interruption of background commands.
+- Handled `/mcp` POST parsing and transport errors gracefully in `http-scan-server` to avoid crashes.
+- Fixed `terminal_start` test that expected auto-detect hint when no shell was explicitly provided.
+
 ## [1.2.12] - 2026-03-08
 
 ### Added
