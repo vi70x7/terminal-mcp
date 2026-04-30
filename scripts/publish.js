@@ -543,7 +543,8 @@ export async function main(args = process.argv.slice(2)) {
   const skipRegistry = flags.has('--skip-registry');
   const skipSmithery = flags.has('--skip-smithery');
   const otpFlag = [...flags].find((f) => f.startsWith('--otp='));
-  const otp = otpFlag ? otpFlag.split('=')[1] : undefined;
+  const otp = otpFlag ? otpFlag.substring(otpFlag.indexOf('=') + 1) : undefined;
+  const buildNpmPublishCmd = () => otp ? `npm publish --access public --otp=${otp}` : 'npm publish --access public';
 
   let fileSnapshots = null;
   let npmPublished = false;
@@ -569,8 +570,7 @@ export async function main(args = process.argv.slice(2)) {
       console.log('\n📦 Phase 1: Publishing to npm... SKIPPED (--skip-npm)');
     } else {
       console.log('\n📦 Phase 1: Publishing to npm...');
-      const npmPublishCmd = otp ? `npm publish --access public --otp=${otp}` : 'npm publish --access public';
-      runCommand(npmPublishCmd, 'npm publishing failed.');
+      runCommand(buildNpmPublishCmd(), 'npm publishing failed.');
       npmPublished = true;
     }
 
@@ -593,8 +593,7 @@ export async function main(args = process.argv.slice(2)) {
 
           if (classification === 'npm-missing' && !npmPublished) {
             console.log('\n🔄 Registry needs npm package. Publishing to npm first...');
-            const npmPublishCmd = otp ? `npm publish --access public --otp=${otp}` : 'npm publish --access public';
-            runCommand(npmPublishCmd, 'npm publishing failed.');
+            runCommand(buildNpmPublishCmd(), 'npm publishing failed.');
             npmPublished = true;
             console.log('\n🔄 Retrying registry publish...');
             continue;
