@@ -73,7 +73,7 @@ function assertReadTimeouts(timeout, idleTimeout) {
  * @param {import('./session-manager.js').SessionManager} manager
  */
 export function registerTools(server, manager) {
-  const DEFAULT_EXTRA = 'terminal_run_paged,terminal_retry,terminal_diff,terminal_resize,terminal_send_key,terminal_get_history,terminal_write_file';
+  const DEFAULT_EXTRA = 'terminal_run_paged,terminal_retry,terminal_diff,terminal_resize,terminal_send_key,terminal_get_history,terminal_write_file,terminal_watch';
   const _off = new Set(
     (process.env.SMART_TERMINAL_DISABLED_TOOLS ?? DEFAULT_EXTRA).split(',').map(s => s.trim()).filter(Boolean)
   );
@@ -135,13 +135,19 @@ export function registerTools(server, manager) {
       command: z.string(),
       timeout: z.number().int().min(1000).max(600000).default(30000),
       maxLines: z.number().int().min(10).max(10000).default(DEFAULT_EXEC_MAX_LINES),
+      quietExitMs: z.number().int().min(500).max(600000).optional()
+        .describe('Exit if silent for N ms'),
+      minOutputBytes: z.number().int().min(0).default(1)
+        .describe('Min bytes before quiet exit'),
     },
-    async ({ sessionId, command, timeout, maxLines }, extra) => {
+    async ({ sessionId, command, timeout, maxLines, quietExitMs, minOutputBytes }, extra) => {
       const session = manager.get(sessionId);
       const result = await session.exec({
         command,
         timeout,
         maxLines,
+        quietExitMs,
+        minOutputBytes,
         sendNotification: extra.sendNotification,
         progressToken: extra._meta?.progressToken,
       });
@@ -262,11 +268,13 @@ export function registerTools(server, manager) {
       timeout: z.number().int().min(500).max(300000).default(30000),
       idleTimeout: z.number().int().min(100).max(10000).default(500).describe('Must be < timeout'),
       maxLines: z.number().int().min(10).max(10000).default(DEFAULT_READ_MAX_LINES),
+      since: z.number().int().min(0).optional()
+        .describe('Byte position for inc. read'),
     },
-    async ({ sessionId, timeout, idleTimeout, maxLines }) => {
+    async ({ sessionId, timeout, idleTimeout, maxLines, since }) => {
       assertReadTimeouts(timeout, idleTimeout);
       const session = manager.get(sessionId);
-      const result = await session.read({ timeout, idleTimeout, maxLines });
+      const result = await session.read({ timeout, idleTimeout, maxLines, since });
       return jsonContent(result);
     }
   );
@@ -344,6 +352,34 @@ export function registerTools(server, manager) {
     }
   );
 
+  // --- terminal_watch ---
+  tool(
+    'terminal_watch',
+    'Wait for a pattern match in session output.',
+    {
+      sessionId: z.string(),
+      triggers: z.array(z.object({
+        id: z.string().describe('Trigger label, returned in response'),
+        pattern: z.string().describe('Regex or literal pattern'),
+        isRegex: z.boolean().default(true),
+        cooldownMs: z.number().int().min(0).default(0)
+          .describe('Min ms between matches'),
+      })).min(1).max(10),
+      timeout: z.number().int().min(1000).max(3600000).default(60000),
+      quietExitMs: z.number().int().min(0).optional()
+        .describe('Exit if no output for N ms'),
+      contextLines: z.number().int().min(0).max(50).default(3)
+        .describe('Context lines before match'),
+      since: z.number().int().min(0).optional()
+        .describe('Match after byte position'),
+    },
+    async ({ sessionId, triggers, timeout, quietExitMs, contextLines, since }) => {
+      const session = manager.get(sessionId);
+      const result = await session.watch({ triggers, timeout, quietExitMs, contextLines, since });
+      return jsonContent(result);
+    }
+  );
+
   // --- terminal_retry ---
   tool(
     'terminal_retry',
@@ -400,10 +436,45 @@ export function registerTools(server, manager) {
     'Stop a terminal session.',
     {
       sessionId: z.string(),
+      snapshotLines: z.number().int().min(0).max(2000).default(0)
+        .describe('Return last N lines. 0 = none.'),
+      transcriptPath: z.string().optional()
+        .describe('Write history to this path'),
     },
-    async ({ sessionId }) => {
+    async ({ sessionId, snapshotLines, transcriptPath }) => {
+      const session = manager.get(sessionId);
+
+      let snapshot = null;
+      let transcript = null;
+
+      if (snapshotLines > 0) {
+        const hist = session.getHistory({ offset: 0, limit: snapshotLines, format: 'text' });
+        snapshot = {
+          text: hist.text,
+          lineCount: hist.returnedTo - hist.returnedFrom,
+          totalLines: hist.totalLines,
+        };
+      }
+
+      if (transcriptPath) {
+        const absolutePath = resolve(transcriptPath);
+        try {
+          await mkdir(dirname(absolutePath), { recursive: true });
+          const full = session.getHistory({ offset: 0, limit: 10000, format: 'text' });
+          await writeFile(absolutePath, full.text, 'utf-8');
+          transcript = { path: absolutePath, bytes: Buffer.byteLength(full.text) };
+        } catch (err) {
+          return errorContent(`Failed to write transcript: ${formatFsError(err)}`);
+        }
+      }
+
       manager.stop(sessionId);
-      return jsonContent({ success: true, message: `Session ${sessionId} stopped.` });
+      return jsonContent({
+        success: true,
+        message: `Session ${sessionId} stopped.`,
+        ...(snapshot && { snapshot }),
+        ...(transcript && { transcript }),
+      });
     }
   );
 

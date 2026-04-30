@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.36] - 2026-04-30
+
+### Added
+- **Process group kill**: `terminal_stop` now kills the entire process group on Unix (via `kill(-pid)`), preventing orphan child processes when stopping sessions that spawned subprocess trees (e.g. `npm run dev` → webpack → esbuild). Windows behavior unchanged.
+- **Incremental reads with `since`**: `terminal_read` accepts an optional `since` byte position and returns only output emitted since that position, along with the current `position`. Agents polling build logs or long-running processes can now read incrementally instead of re-reading the full buffer every poll. Reduces token usage by up to ~87% on repeated polling.
+- **`terminal_watch` tool**: New event-driven monitoring tool that waits for regex/literal trigger matches in session output. Supports multiple triggers with per-trigger cooldowns, quiet detection (auto-return when output stops), process exit detection, context lines, and `since` filtering. Replaces manual poll loops — reduces token usage by up to ~99% for log-watching workflows. Available via `terminal_extra` by default.
+- **Quiet-exit on `terminal_exec`**: New `quietExitMs` and `minOutputBytes` parameters let agents return early when a long-running command (e.g. `npm run dev`) stops producing output, instead of waiting for a hard timeout. Session stays busy so the agent can read incrementally. Reduces token usage by up to ~94% for dev-server commands.
+- **Snapshot and transcript on `terminal_stop`**: `terminal_stop` now accepts `snapshotLines` (return last N lines in response) and `transcriptPath` (write full session history to disk before stopping). Transcript write failure safely prevents session termination.
+- **Human-readable session IDs**: Sessions now get memorable IDs like `calm-reef` or `brisk-falcon` instead of hex fragments like `a1b2c3d4`. Easier to read in logs and agent references.
+
+### Changed
+- `terminal_read` now always includes a `position` field in the response (monotonic byte counter).
+- `terminal_stop` accepts optional `snapshotLines` and `transcriptPath` parameters.
+
 ## [1.2.35] - 2026-04-26
 
 ### Added

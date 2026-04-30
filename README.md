@@ -36,12 +36,16 @@ Think of this as a **controlled keyboard + terminal for an agent running inside 
 ### Long output and long-running commands
 
 - **Interactive reads and writes** -- `terminal_write` + `terminal_read` support prompts, REPLs, and other interactive programs without leaving the current session.
+- **Incremental reads** -- `terminal_read` accepts a `since` byte position to return only new output since the last read, avoiding re-reading the full buffer on every poll.
 - **Pattern waiting** -- `terminal_wait` can pause until specific text appears, such as `server listening on port`.
+- **Event-driven monitoring** -- `terminal_watch` waits for trigger patterns in session output, returning only on match, quiet, timeout, or exit. Eliminates poll-loop token waste.
+- **Quiet-exit detection** -- `terminal_exec` can return early when output goes silent (`quietExitMs`), instead of waiting for a hard timeout.
 - **Retry helper** -- `terminal_retry` can re-run flaky commands with bounded backoff and optional output matching.
 - **Best-effort progress notifications** -- Long `terminal_exec` / `terminal_wait` calls can emit `notifications/progress` when the client provides a progress token.
 - **Output truncation** -- `terminal_exec` and `terminal_read` shorten very large output by returning the beginning and the end.
 - **Paged read-only output** -- `terminal_run_paged` returns large read-only output one page at a time instead of sending the full result at once.
 - **Output diffing** -- `terminal_diff` compares two command results and returns a unified diff.
+- **Session snapshots** -- `terminal_stop` can capture a tail snapshot or write a full transcript to disk before stopping.
 
 ### Safety and usability
 
@@ -49,7 +53,8 @@ Think of this as a **controlled keyboard + terminal for an agent running inside 
 - **Structured parsers** -- Some supported read-only commands can return both raw text and parsed output.
 - **Blocking mitigations** -- Disables pagers (`GIT_PAGER=cat`, `PAGER=cat`), suppresses PowerShell progress output, and sets UTF-8 for `cmd.exe` on Windows.
 - **Special key support** -- Can send Ctrl+C, Tab, arrow keys, and similar keys without manually constructing escape sequences.
-- **Session management** -- Supports named sessions, idle cleanup, and up to 10 concurrent sessions.
+- **Process group cleanup** -- `terminal_stop` kills the entire process group on Unix, preventing orphan child processes.
+- **Session management** -- Supports named sessions, idle cleanup, and up to 10 concurrent sessions. Session IDs are human-readable (e.g. `calm-reef`).
 - **Shell auto-detection** -- Windows: `pwsh.exe` > `powershell.exe` > `cmd.exe`. Linux/macOS: `$SHELL` > `bash` > `sh`.
 
 Progress notifications are not the same as full stdout streaming. They currently send periodic status updates for `terminal_exec` and `terminal_wait`, usually based on elapsed time and the latest output line. Whether you see them depends on your MCP client.
@@ -60,21 +65,30 @@ This MCP does not magically compress terminal output, but it **can help agents u
 
 The main benefit is **model-context efficiency**, not guaranteed savings in the underlying command's runtime or total bytes produced.
 
+### Polling and long-running processes
+
+- Use **`terminal_read({ since })`** to read incrementally. Each call returns only new output since the last `position`, instead of re-reading the full buffer. Reduces token usage by up to ~87% on repeated polling.
+- Use **`terminal_watch`** instead of a manual poll loop when waiting for a specific pattern. A single call returns on match, quiet, timeout, or exit — reduces token usage by up to ~99% for log-watching workflows.
+- Use **`terminal_exec({ quietExitMs })`** for long-running commands (dev servers, watchers) that never produce a completion marker. Returns early when output stops, instead of waiting for a hard timeout. Reduces token usage by up to ~94%.
+
+### Output size control
+
 - Use **`terminal_run_paged`** for large read-only output when **the agent** wants one page of the returned result at a time.
 - Lower **`maxLines`**, **`pageSize`**, or **`tailLines`** when **the agent** only needs a narrow slice of the output.
 - Use **`summary: true`** or **`parseOnly: true`** with `terminal_run` when **the agent** benefits more from structured results than raw text.
 - Use **`terminal_wait({ returnMode: "match-only" })`** when the agent only needs to know whether a pattern appeared.
 - Use **`terminal_get_history`** when **the agent** needs to revisit earlier output without re-dumping the whole session into the conversation.
+- Use **`terminal_stop({ transcriptPath })`** to offload large session history to disk instead of returning it in the response.
 
 In practice, this lets agents inspect terminal state more selectively instead of repeatedly dumping large logs back into the conversation.
 
 ### Reducing tool definition overhead
 
-By default, the 8 most-used tools are registered with full schemas and 7 convenience tools are collected behind a single lightweight `terminal_extra` meta-tool (~30 tokens instead of ~1,500).
+By default, the 8 most-used tools are registered with full schemas and 8 convenience tools are collected behind a single lightweight `terminal_extra` meta-tool (~30 tokens instead of ~1,700).
 
 **Default core tools**: `terminal_start`, `terminal_exec`, `terminal_run`, `terminal_read`, `terminal_write`, `terminal_wait`, `terminal_stop`, `terminal_list`
 
-**Default extra tools** (behind `terminal_extra`): `terminal_run_paged`, `terminal_retry`, `terminal_diff`, `terminal_resize`, `terminal_send_key`, `terminal_get_history`, `terminal_write_file`
+**Default extra tools** (behind `terminal_extra`): `terminal_run_paged`, `terminal_retry`, `terminal_diff`, `terminal_resize`, `terminal_send_key`, `terminal_get_history`, `terminal_write_file`, `terminal_watch`
 
 Extra tools are **not hidden** — the agent sees the tool names in the `terminal_extra` description and can:
 
@@ -101,21 +115,21 @@ Use `SMART_TERMINAL_DISABLED_TOOLS` to customize which tools are extra, or set i
 
 ```json
 "env": {
-  "SMART_TERMINAL_DISABLED_TOOLS": "terminal_run,terminal_run_paged,terminal_retry,terminal_diff,terminal_write_file,terminal_resize,terminal_send_key,terminal_get_history"
+  "SMART_TERMINAL_DISABLED_TOOLS": "terminal_run,terminal_run_paged,terminal_retry,terminal_diff,terminal_write_file,terminal_resize,terminal_send_key,terminal_get_history,terminal_watch"
 }
 ```
 
-5 core tools + `terminal_extra` holding 10 tools on demand.
+5 core tools + `terminal_extra` holding 9 tools on demand.
 
-**Agent-focused setup** — `terminal_run` instead of `terminal_exec`:
+**Agent-focused setup** -- `terminal_run` instead of `terminal_exec`:
 
 ```json
 "env": {
-  "SMART_TERMINAL_DISABLED_TOOLS": "terminal_exec,terminal_diff,terminal_retry,terminal_resize,terminal_send_key,terminal_write,terminal_read,terminal_get_history"
+  "SMART_TERMINAL_DISABLED_TOOLS": "terminal_exec,terminal_diff,terminal_retry,terminal_resize,terminal_send_key,terminal_write,terminal_read,terminal_get_history,terminal_watch"
 }
 ```
 
-7 core tools + `terminal_extra` holding 8 tools on demand.
+7 core tools + `terminal_extra` holding 9 tools on demand.
 
 ## Installation
 
@@ -183,7 +197,7 @@ If you want to pin an exact release instead of following the stable tag, replace
 
 ## Tools
 
-By default, 8 core tools are registered with full schemas and 7 convenience tools are available on demand via `terminal_extra` (see [Reducing tool definition overhead](#reducing-tool-definition-overhead)).
+By default, 8 core tools are registered with full schemas and 8 convenience tools are available on demand via `terminal_extra` (see [Reducing tool definition overhead](#reducing-tool-definition-overhead)).
 
 ### Core tools
 
@@ -212,8 +226,10 @@ Execute a command with deterministic completion detection. Large outputs are tru
 | `command` | string | *required* | Command to execute |
 | `timeout` | number | 30000 | Timeout in ms (max 10min) |
 | `maxLines` | number | 200 | Max output lines before truncation |
+| `quietExitMs` | number | -- | Return early if output is silent for N ms |
+| `minOutputBytes` | number | 1 | Min bytes before quiet detection can trigger |
 
-**Returns**: `output`, `exitCode`, `cwd`, `timedOut`
+**Returns**: `output`, `exitCode`, `cwd`, `timedOut`, optional `quietExited`, optional `hint`
 
 ### `terminal_run`
 
@@ -246,7 +262,7 @@ Write raw data to a terminal (for interactive programs). Follow with `terminal_r
 
 ### `terminal_read`
 
-Read buffered output with idle detection. Large outputs are truncated to head + tail based on `maxLines`.
+Read buffered output with idle detection. Large outputs are truncated to head + tail based on `maxLines`. Pass `since` to read incrementally — returns only output emitted after the given byte position.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -254,8 +270,9 @@ Read buffered output with idle detection. Large outputs are truncated to head + 
 | `timeout` | number | 30000 | Hard timeout in ms |
 | `idleTimeout` | number | 500 | Return after this many ms of silence |
 | `maxLines` | number | 200 | Max output lines |
+| `since` | number | -- | Byte position from a prior read response |
 
-**Returns**: `output`, `timedOut`
+**Returns**: `output`, `timedOut`, `position`, optional `truncated`
 
 ### `terminal_wait`
 
@@ -273,11 +290,15 @@ Wait for a specific pattern in the output stream. By default, responses return o
 
 ### `terminal_stop`
 
-Stop and clean up a terminal session.
+Stop and clean up a terminal session. Optionally capture a snapshot of recent output or write the full transcript to disk before stopping. On Unix, kills the entire process group to prevent orphan child processes.
 
-| Param | Type | Description |
-|-------|------|-------------|
-| `sessionId` | string | Session ID to stop |
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sessionId` | string | *required* | Session ID to stop |
+| `snapshotLines` | number | 0 | Return last N lines of output (0 = none) |
+| `transcriptPath` | string | -- | Write full history to this absolute path |
+
+**Returns**: `success`, `message`, optional `snapshot`, optional `transcript`
 
 ### `terminal_list`
 
@@ -401,12 +422,36 @@ Write content directly to a file on disk. Resolves paths relative to the session
 
 **Returns**: `success`, `path` (absolute), `size` (bytes), `append`
 
+### `terminal_watch`
+
+Wait for one or more trigger patterns in session output. Returns on first match, quiet detection, timeout, or process exit. Replaces manual poll loops — a single call blocks until an event fires.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sessionId` | string | *required* | Session ID |
+| `triggers` | array | *required* | 1–10 trigger objects (see below) |
+| `timeout` | number | 60000 | Hard timeout in ms (max 1hr) |
+| `quietExitMs` | number | -- | Return if no output for N ms |
+| `contextLines` | number | 3 | Lines of context before match |
+| `since` | number | -- | Only match output after this byte position |
+
+**Trigger object**:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | *required* | Label returned in response |
+| `pattern` | string | *required* | Regex or literal pattern |
+| `isRegex` | boolean | `true` | Set `false` for literal match |
+| `cooldownMs` | number | 0 | Min ms between matches for this trigger |
+
+**Returns**: `reason` (`trigger`/`quiet`/`timeout`/`exit`), `position`, `timedOut`, optional `triggerId`, `matchedLine`, `context`
+
 ## Usage Examples
 
 ### Run a command
 
 ```
-terminal_start()                           -> { sessionId: "a1b2c3d4" }
+terminal_start()                           -> { sessionId: "calm-reef" }
 terminal_exec({ sessionId, command: "ls -la" })  -> { output: "...", exitCode: 0, cwd: "/home/user" }
 ```
 
@@ -461,6 +506,42 @@ terminal_wait({ sessionId, pattern: "listening on port", timeout: 60000 })
 terminal_wait({ sessionId, pattern: "listening on port", returnMode: "full" })
 ```
 
+### Watch for build events
+
+```
+terminal_extra({ tool: "terminal_watch", args: {
+  sessionId,
+  triggers: [
+    { id: "success", pattern: "webpack: Compiled successfully" },
+    { id: "error", pattern: "ERROR in" }
+  ],
+  timeout: 120000,
+  quietExitMs: 10000
+}})
+-> { reason: "trigger", triggerId: "success", matchedLine: "webpack: Compiled successfully", context: [...], position: 184320 }
+```
+
+### Incrementally poll a build log
+
+```
+const r1 = terminal_read({ sessionId })           -> { output: "Building...", position: 5000 }
+const r2 = terminal_read({ sessionId, since: 5000 }) -> { output: "Done.", position: 5200 }
+```
+
+### Quiet-exit a dev server
+
+```
+terminal_exec({ sessionId, command: "npm run dev", quietExitMs: 3000, minOutputBytes: 50 })
+-> { output: "webpack: Compiled successfully", quietExited: true, hint: "Command is still running..." }
+```
+
+### Stop with a transcript
+
+```
+terminal_stop({ sessionId, snapshotLines: 20, transcriptPath: "/tmp/session.log" })
+-> { success: true, snapshot: { text: "...", lineCount: 20, totalLines: 500 }, transcript: { path: "/tmp/session.log", bytes: 12345 } }
+```
+
 ### Retry a flaky command
 
 ```
@@ -487,6 +568,7 @@ src/
   pty-session.js      PTY session: marker injection, idle read, buffer mgmt
   smart-tools.js      Retry and diff helpers for higher-level terminal tools
   regex-utils.js      Shared user-regex validation and compilation
+  session-id.js       Human-readable session ID generation
   session-manager.js  Session lifecycle, TTL cleanup, concurrency limits
   shell-detector.js   Cross-platform shell auto-detection
   ansi.js             ANSI escape code stripping

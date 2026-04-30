@@ -106,6 +106,8 @@ export class PtySession {
 
     /** @type {string} */
     this._buffer = '';
+    /** Monotonic byte counter — total bytes ever emitted. Never resets. */
+    this._totalBytesEmitted = 0;
     /** @type {string[]} Rolling history of cleaned output lines */
     this._history = [];
     /** Total lines ever appended (monotonic counter for detecting eviction) */
@@ -133,6 +135,7 @@ export class PtySession {
     this.process.onData((data) => {
       this.lastActivity = Date.now();
       this._buffer += data;
+      this._totalBytesEmitted += data.length;
 
       if (this._pendingMarker && this._buffer.includes(this._pendingMarker)) {
         this.busy = false;
@@ -186,11 +189,13 @@ export class PtySession {
    * @param {string} opts.command
    * @param {number} [opts.timeout=30000]
    * @param {number} [opts.maxLines=100]
+   * @param {number} [opts.quietExitMs] - Return early if output is silent for this long after first output
+   * @param {number} [opts.minOutputBytes=1] - Require at least this many bytes before quiet detection
    * @param {Function} [opts.sendNotification] - MCP sendNotification function for progress
    * @param {string|number} [opts.progressToken] - Progress token from client
-   * @returns {Promise<{ output: string, exitCode: number|null, cwd: string|null, timedOut: boolean }>}
+   * @returns {Promise<{ output: string, exitCode: number|null, cwd: string|null, timedOut: boolean, quietExited?: boolean, hint?: string }>}
    */
-  async exec({ command, timeout = 30000, maxLines = DEFAULT_EXEC_MAX_LINES, sendNotification, progressToken }) {
+  async exec({ command, timeout = 30000, maxLines = DEFAULT_EXEC_MAX_LINES, quietExitMs, minOutputBytes = 1, sendNotification, progressToken }) {
     if (this.busy) {
       throw new Error(`Session ${this.id} is busy with a background command. Wait for it to finish, or use terminal_read to check output, or terminal_send_key("ctrl+c") to abort it.`);
     }
@@ -209,25 +214,28 @@ export class PtySession {
     try {
       this.process.write(wrappedCommand + '\r');
 
-      const raw = await this._waitForMarker(marker, timeout, sendNotification, progressToken);
-      const timedOut = !raw.includes(marker);
+      const { buffer: raw, reason } = await this._waitForMarker(marker, timeout, quietExitMs, minOutputBytes, sendNotification, progressToken);
+      const markerFound = raw.includes(marker);
+      const timedOut = reason === 'timeout';
+      const quietExited = reason === 'quiet';
 
       const { output, exitCode, cwd } = this._parseOutput(raw, marker, cwdMarker, preMarker);
       if (cwd) this.cwd = cwd;
 
-      if (timedOut) {
-        this._pendingMarker = marker;
-      } else {
+      if (markerFound) {
         this.busy = false;
         this._pendingMarker = null;
+      } else {
+        this._pendingMarker = marker;
       }
 
       return {
         output: this._truncateOutput(output, maxLines),
-        exitCode,
+        exitCode: markerFound ? exitCode : null,
         cwd: this.cwd,
         timedOut,
-        ...(timedOut && { hint: 'Command is still running in the background. Session remains busy. Use terminal_read to get new output, or terminal_send_key("ctrl+c") to abort.' }),
+        ...(quietExited && { quietExited: true }),
+        ...((timedOut || quietExited) && { hint: 'Command is still running in the background. Session remains busy. Use terminal_read to get new output, or terminal_send_key("ctrl+c") to abort.' }),
       };
     } catch (err) {
       this.busy = false;
@@ -269,14 +277,20 @@ export class PtySession {
    * @param {number} [opts.timeout=30000]
    * @param {number} [opts.idleTimeout=500]
    * @param {number} [opts.maxLines=80]
-   * @returns {Promise<{ output: string, timedOut: boolean }>}
+   * @param {number} [opts.since] - Absolute byte position; returns output emitted since that position
+   * @returns {Promise<{ output: string, timedOut: boolean, position: number, truncated?: boolean }>}
    */
-  async read({ timeout = 30000, idleTimeout = 500, maxLines = DEFAULT_READ_MAX_LINES } = {}) {
+  async read({ timeout = 30000, idleTimeout = 500, maxLines = DEFAULT_READ_MAX_LINES, since } = {}) {
     if (!this.alive) {
       // Return whatever is left in buffer
       const leftover = stripAnsi(this._consumeUnreadBuffer()).trim();
       this._resetBuffer();
-      return { output: leftover, timedOut: false };
+      return { output: leftover, timedOut: false, position: this._totalBytesEmitted };
+    }
+
+    // Position-based read: return only output since a prior byte position
+    if (since !== undefined) {
+      return this._readSince({ since, timeout, idleTimeout, maxLines });
     }
 
     await this._readUntilIdle(timeout, idleTimeout);
@@ -286,6 +300,7 @@ export class PtySession {
     return {
       output: this._truncateOutput(output, maxLines),
       timedOut: false,
+      position: this._totalBytesEmitted,
     };
   }
 
@@ -374,6 +389,163 @@ export class PtySession {
   }
 
   /**
+   * Read output since an absolute byte position.
+   * @param {object} opts
+   * @param {number} opts.since
+   * @param {number} opts.timeout
+   * @param {number} opts.idleTimeout
+   * @param {number} opts.maxLines
+   * @returns {Promise<{ output: string, timedOut: boolean, position: number, truncated: boolean }>}
+   */
+  async _readSince({ since, timeout, idleTimeout, maxLines }) {
+    const currentPos = this._totalBytesEmitted;
+
+    // If since is at or beyond current position, wait for new data
+    if (since >= currentPos) {
+      await this._readUntilIdle(timeout, idleTimeout);
+    }
+
+    const newPos = this._totalBytesEmitted;
+    const bufferStart = newPos - this._buffer.length;
+    const truncated = since < bufferStart;
+    const fromPos = truncated ? bufferStart : since;
+    const offset = fromPos - bufferStart;
+
+    const raw = offset < this._buffer.length ? this._buffer.slice(Math.max(0, offset)) : '';
+    const output = stripAnsi(raw).trim();
+
+    return {
+      output: this._truncateOutput(output, maxLines),
+      timedOut: false,
+      position: newPos,
+      truncated,
+    };
+  }
+
+  /**
+   * Wait for one of multiple patterns in session output.
+   * Returns on first match, quiet detection, timeout, or process exit.
+   * @param {object} opts
+   * @param {Array<{id: string, pattern: string, isRegex?: boolean, cooldownMs?: number}>} opts.triggers
+   * @param {number} [opts.timeout=60000]
+   * @param {number} [opts.quietExitMs]
+   * @param {number} [opts.contextLines=3]
+   * @param {number} [opts.since]
+   * @returns {Promise<{reason: 'trigger'|'quiet'|'timeout'|'exit', triggerId?: string, matchedLine?: string, context?: string[], position: number, timedOut: boolean}>}
+   */
+  watch({ triggers, timeout = 60000, quietExitMs, contextLines = 3, since } = {}) {
+    const compiled = triggers.map((t) => ({
+      id: t.id,
+      regex: t.isRegex === false ? new RegExp(t.pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) : compileUserRegex(t.pattern),
+      cooldownMs: t.cooldownMs ?? 0,
+      lastFiredAt: 0,
+    }));
+
+    const sincePosition = since ?? this._totalBytesEmitted;
+
+    return new Promise((resolve) => {
+      const contextBuffer = [];
+      let partialLine = '';
+      let resolved = false;
+      let quietTimer;
+      let exitCheckTimer;
+
+      const done = (result) => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(hardTimer);
+        clearTimeout(quietTimer);
+        clearInterval(exitCheckTimer);
+        const idx = this._dataListeners.indexOf(onData);
+        if (idx !== -1) this._dataListeners.splice(idx, 1);
+        resolve(result);
+      };
+
+      const hardTimer = setTimeout(() => {
+        done({ reason: 'timeout', timedOut: true, position: this._totalBytesEmitted });
+      }, timeout);
+
+      const armQuiet = () => {
+        if (!quietExitMs) return;
+        clearTimeout(quietTimer);
+        quietTimer = setTimeout(() => {
+          done({ reason: 'quiet', timedOut: false, position: this._totalBytesEmitted });
+        }, quietExitMs);
+      };
+
+      const testLine = (line) => {
+        const now = Date.now();
+        for (const trigger of compiled) {
+          if (trigger.cooldownMs > 0 && now - trigger.lastFiredAt < trigger.cooldownMs) continue;
+          if (trigger.regex.test(line)) {
+            trigger.lastFiredAt = now;
+            done({
+              reason: 'trigger',
+              triggerId: trigger.id,
+              matchedLine: line,
+              context: contextBuffer.slice(-contextLines),
+              position: this._totalBytesEmitted,
+              timedOut: false,
+            });
+            return;
+          }
+        }
+      };
+
+      const processCleanLine = (line) => {
+        contextBuffer.push(line);
+        if (contextBuffer.length > contextLines + 1) {
+          contextBuffer.shift();
+        }
+        testLine(line);
+      };
+
+      const onData = (data) => {
+        armQuiet();
+
+        const clean = stripAnsi(data);
+        const parts = clean.split(/\r?\n/);
+        parts[0] = partialLine + parts[0];
+
+        for (let i = 0; i < parts.length - 1; i++) {
+          processCleanLine(parts[i]);
+          if (resolved) return;
+        }
+        partialLine = parts[parts.length - 1];
+      };
+
+      // Check existing buffer for content since the specified position
+      if (sincePosition < this._totalBytesEmitted) {
+        const bufferStart = this._totalBytesEmitted - this._buffer.length;
+        const fromPos = Math.max(sincePosition, bufferStart);
+        const offset = fromPos - bufferStart;
+        if (offset < this._buffer.length) {
+          const existing = stripAnsi(this._buffer.slice(Math.max(0, offset)));
+          const parts = existing.split(/\r?\n/);
+          for (const line of parts) {
+            if (line.trim()) {
+              contextBuffer.push(line);
+              if (contextBuffer.length > contextLines + 1) contextBuffer.shift();
+              testLine(line);
+              if (resolved) return;
+            }
+          }
+        }
+      }
+
+      // Handle process exit during watch
+      exitCheckTimer = setInterval(() => {
+        if (!this.alive) {
+          done({ reason: 'exit', timedOut: false, position: this._totalBytesEmitted });
+        }
+      }, 200);
+
+      this._dataListeners.push(onData);
+      armQuiet();
+    });
+  }
+
+  /**
    * Resize terminal.
    * @param {number} cols
    * @param {number} rows
@@ -389,12 +561,25 @@ export class PtySession {
 
   /**
    * Kill the PTY process and clean up.
+   * On Unix, kills the entire process group to prevent orphan children.
+   * @param {string} [signal='SIGTERM']
    */
-  kill() {
-    if (this.alive) {
-      this.process.kill();
-      this.alive = false;
+  kill(signal = 'SIGTERM') {
+    if (!this.alive) return;
+    const pid = this.process.pid;
+
+    if (process.platform !== 'win32' && pid) {
+      try {
+        process.kill(-pid, signal);
+      } catch (err) {
+        if (err.code !== 'ESRCH') {
+          try { this.process.kill(signal); } catch {}
+        }
+      }
+    } else {
+      try { this.process.kill(); } catch {}
     }
+    this.alive = false;
   }
 
   /**
@@ -513,37 +698,58 @@ export class PtySession {
 
   /**
    * Wait for the completion marker in the output stream.
+   * @param {string} marker
+   * @param {number} timeout
+   * @param {number} [quietExitMs]
+   * @param {number} [minOutputBytes]
+   * @param {Function} [sendNotification]
+   * @param {string|number} [progressToken]
+   * @returns {Promise<{buffer: string, reason: 'marker'|'timeout'|'quiet'}>}
    */
-  _waitForMarker(marker, timeout, sendNotification, progressToken) {
+  _waitForMarker(marker, timeout, quietExitMs, minOutputBytes = 1, sendNotification, progressToken) {
     return new Promise((resolve) => {
       const startTime = Date.now();
       let lastProgressAt = 0;
+      let bytesSeen = 0;
+      let quietTimer;
 
       const cleanup = () => {
         clearTimeout(timer);
+        clearTimeout(quietTimer);
         const idx = this._dataListeners.indexOf(onData);
         if (idx !== -1) this._dataListeners.splice(idx, 1);
       };
 
       const timer = setTimeout(() => {
         cleanup();
-        resolve(this._buffer);
+        resolve({ buffer: this._buffer, reason: 'timeout' });
       }, timeout);
+
+      const armQuiet = () => {
+        if (!quietExitMs || bytesSeen < minOutputBytes) return;
+        clearTimeout(quietTimer);
+        quietTimer = setTimeout(() => {
+          cleanup();
+          resolve({ buffer: this._buffer, reason: 'quiet' });
+        }, quietExitMs);
+      };
 
       const checkBuffer = () => {
         if (this._buffer.includes(marker)) {
           cleanup();
-          resolve(this._buffer);
+          resolve({ buffer: this._buffer, reason: 'marker' });
         }
       };
 
       const onData = (_data) => {
+        bytesSeen += _data.length;
         // Send progress
         if (sendNotification && progressToken && Date.now() - lastProgressAt > 1000) {
           lastProgressAt = Date.now();
           const clean = stripAnsi(this._buffer);
           this._sendProgress(sendNotification, progressToken, clean, startTime, timeout);
         }
+        armQuiet();
         checkBuffer();
       };
 

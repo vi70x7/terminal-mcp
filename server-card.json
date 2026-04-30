@@ -1,7 +1,7 @@
 {
   "serverInfo": {
     "name": "smart-terminal-mcp",
-    "version": "1.2.35"
+    "version": "1.2.36"
   },
   "tools": [
     {
@@ -65,6 +65,18 @@
             "minimum": 10,
             "maximum": 10000,
             "default": 200
+          },
+          "quietExitMs": {
+            "type": "integer",
+            "minimum": 500,
+            "maximum": 600000,
+            "description": "Exit if silent for N ms"
+          },
+          "minOutputBytes": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 1,
+            "description": "Min bytes before quiet exit"
           }
         },
         "required": [
@@ -200,6 +212,11 @@
             "minimum": 10,
             "maximum": 10000,
             "default": 200
+          },
+          "since": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Byte position for inc. read"
           }
         },
         "required": [
@@ -259,6 +276,17 @@
         "properties": {
           "sessionId": {
             "type": "string"
+          },
+          "snapshotLines": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2000,
+            "default": 0,
+            "description": "Return last N lines. 0 = none."
+          },
+          "transcriptPath": {
+            "type": "string",
+            "description": "Write history to this path"
           }
         },
         "required": [
@@ -285,7 +313,7 @@
     },
     {
       "name": "terminal_extra",
-      "description": "7 more tools: terminal_run_paged, terminal_get_history, terminal_resize, terminal_send_key, terminal_retry, terminal_diff, terminal_write_file. list=true for full schemas, or pass tool + args to call.",
+      "description": "8 more tools: terminal_run_paged, terminal_get_history, terminal_resize, terminal_send_key, terminal_watch, terminal_retry, terminal_diff, terminal_write_file. list=true for full schemas, or pass tool + args to call.",
       "inputSchema": {
         "type": "object",
         "properties": {

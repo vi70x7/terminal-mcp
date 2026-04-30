@@ -1,9 +1,9 @@
-import { randomUUID } from 'node:crypto';
 import { stat } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
 import { platform } from 'node:os';
 import { PtySession } from './pty-session.js';
 import { detectShell, isAvailable } from './shell-detector.js';
+import { generateSessionId } from './session-id.js';
 
 const DEFAULT_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_SESSIONS = 10;
@@ -45,7 +45,7 @@ export class SessionManager {
     const resolvedShell = shell ? resolveUserShell(shell) : detected.shell;
     const shellArgs = shell ? [] : detected.args;
 
-    const id = randomUUID().slice(0, 8);
+    const id = generateSessionId(new Set(this._sessions.keys()));
     const session = new this._SessionClass({
       id,
       shell: resolvedShell,

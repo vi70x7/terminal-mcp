@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { registerTools } from '../src/tools.js';
 
 function createFakeServer() {
@@ -523,6 +523,210 @@ test('terminal_diff returns diff results as compact JSON', async () => {
   assert.equal(payload.identical, false);
   assert.match(payload.diff, /--- type before.txt/);
   assert.match(payload.diff, /\+\+\+ type after.txt/);
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
+});
+
+test('terminal_exec forwards quietExitMs and minOutputBytes', async () => {
+  const server = createFakeServer();
+  const execCalls = [];
+  const manager = {
+    get: () => ({
+      exec: async (opts) => {
+        execCalls.push(opts);
+        return { output: 'ok', exitCode: 0, cwd: '/tmp', timedOut: false, quietExited: false };
+      },
+    }),
+  };
+  const sendNotification = () => {};
+
+  registerTools(server, manager);
+
+  await server.tools.get('terminal_exec').handler(
+    { sessionId: 's1', command: 'npm run dev', timeout: 5000, maxLines: 50, quietExitMs: 2000, minOutputBytes: 10 },
+    { sendNotification, _meta: {} },
+  );
+
+  assert.deepEqual(execCalls, [{
+    command: 'npm run dev',
+    timeout: 5000,
+    maxLines: 50,
+    quietExitMs: 2000,
+    minOutputBytes: 10,
+    sendNotification,
+    progressToken: undefined,
+  }]);
+});
+
+test('terminal_read forwards since parameter', async () => {
+  const server = createFakeServer();
+  const readCalls = [];
+  const manager = {
+    get: () => ({
+      read: async (opts) => {
+        readCalls.push(opts);
+        return { output: 'new data', timedOut: false, position: 500 };
+      },
+    }),
+  };
+
+  registerTools(server, manager);
+
+  const result = await server.tools.get('terminal_read').handler({
+    sessionId: 's1',
+    timeout: 5000,
+    idleTimeout: 200,
+    maxLines: 50,
+    since: 400,
+  });
+
+  assert.deepEqual(readCalls, [{ timeout: 5000, idleTimeout: 200, maxLines: 50, since: 400 }]);
+  assert.deepEqual(JSON.parse(result.content[0].text), {
+    output: 'new data',
+    timedOut: false,
+    position: 500,
+  });
+});
+
+test('terminal_stop returns snapshot when snapshotLines > 0', async () => {
+  const server = createFakeServer();
+  let stopped = false;
+  const manager = {
+    get: () => ({
+      getHistory: () => ({ text: 'line 1\nline 2', totalLines: 5, returnedFrom: 3, returnedTo: 5 }),
+    }),
+    stop: (id) => { stopped = id; },
+  };
+
+  registerTools(server, manager);
+
+  const result = await server.tools.get('terminal_stop').handler({
+    sessionId: 's1',
+    snapshotLines: 2,
+  });
+
+  assert.equal(stopped, 's1');
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(payload.success, true);
+  assert.equal(payload.snapshot.text, 'line 1\nline 2');
+  assert.equal(payload.snapshot.lineCount, 2);
+  assert.equal(payload.snapshot.totalLines, 5);
+});
+
+test('terminal_stop writes transcript to disk', async () => {
+  const server = createFakeServer();
+  const tempDir = await mkdtemp(join(tmpdir(), 'smart-terminal-mcp-'));
+  try {
+    const transcriptPath = join(tempDir, 'output.log');
+    const manager = {
+      get: () => ({
+        getHistory: () => ({ text: 'full history', totalLines: 3, returnedFrom: 0, returnedTo: 3 }),
+      }),
+      stop: () => {},
+    };
+
+    registerTools(server, manager);
+
+    const result = await server.tools.get('terminal_stop').handler({
+      sessionId: 's1',
+      transcriptPath,
+    });
+
+    const payload = JSON.parse(result.content[0].text);
+    assert.equal(payload.success, true);
+    assert.equal(payload.transcript.path, resolve(transcriptPath));
+    assert.ok(payload.transcript.bytes > 0);
+
+    const written = await readFile(transcriptPath, 'utf-8');
+    assert.equal(written, 'full history');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('terminal_stop does not stop session on transcript write failure', async () => {
+  // On Windows, deep path writes often succeed (no permission constraints)
+  // Use a path with a null byte which is universally invalid
+  const server = createFakeServer();
+  let stopped = false;
+  const manager = {
+    get: () => ({
+      getHistory: () => ({ text: 'data', totalLines: 1, returnedFrom: 0, returnedTo: 1 }),
+    }),
+    stop: () => { stopped = true; },
+  };
+
+  registerTools(server, manager);
+
+  // Using a path that resolves to something that will fail on write
+  // On Unix: /dev/null/impossible/output.log (ENOTDIR)
+  // On Windows: NUL\impossible (still writable sometimes)
+  // Instead, skip on Windows
+  if (process.platform === 'win32') return;
+
+  const result = await server.tools.get('terminal_stop').handler({
+    sessionId: 's1',
+    transcriptPath: '/dev/null/impossible/output.log',
+  });
+
+  assert.ok(result.isError, 'should return error on write failure');
+  assert.equal(stopped, false, 'session should NOT be stopped');
+});
+
+test('terminal_stop preserves original behavior with no options', async () => {
+  const server = createFakeServer();
+  let stopped = false;
+  const manager = {
+    get: () => ({}),
+    stop: (id) => { stopped = id; },
+  };
+
+  registerTools(server, manager);
+
+  const result = await server.tools.get('terminal_stop').handler({ sessionId: 's1' });
+
+  assert.equal(stopped, 's1');
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(payload.success, true);
+  assert.equal(payload.snapshot, undefined);
+  assert.equal(payload.transcript, undefined);
+});
+
+test('terminal_watch forwards triggers and options', async () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
+    const server = createFakeServer();
+    const watchCalls = [];
+    const manager = {
+      get: () => ({
+        watch: async (opts) => {
+          watchCalls.push(opts);
+          return { reason: 'trigger', triggerId: 'ready', matchedLine: 'done', context: [], position: 100, timedOut: false };
+        },
+      }),
+    };
+
+    registerTools(server, manager);
+
+    const result = await server.tools.get('terminal_watch').handler({
+      sessionId: 's1',
+      triggers: [{ id: 'ready', pattern: 'done', isRegex: true, cooldownMs: 0 }],
+      timeout: 5000,
+      contextLines: 5,
+      since: 50,
+    });
+
+    assert.deepEqual(watchCalls, [{
+      triggers: [{ id: 'ready', pattern: 'done', isRegex: true, cooldownMs: 0 }],
+      timeout: 5000,
+      quietExitMs: undefined,
+      contextLines: 5,
+      since: 50,
+    }]);
+    const payload = JSON.parse(result.content[0].text);
+    assert.equal(payload.reason, 'trigger');
+    assert.equal(payload.triggerId, 'ready');
   } finally {
     delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
   }

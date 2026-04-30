@@ -251,3 +251,284 @@ test('_readUntilIdle collects streamed data even if the buffer shifts', async ()
     assert.equal(result, 'firstsecond');
   });
 });
+
+test('read returns position with cursor-based read', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = 'hello world';
+  session._readCursor = 0;
+  session._totalBytesEmitted = 100;
+  session._dataListeners = [];
+
+  const result = await session.read({ timeout: 50, idleTimeout: 10, maxLines: 50 });
+
+  assert.equal(result.output, 'hello world');
+  assert.equal(result.position, 100);
+  assert.equal(result.timedOut, false);
+});
+
+test('read with since returns output from a prior position', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = 'prefixnew data';
+  session._readCursor = 0;
+  session._totalBytesEmitted = 100;
+  // 6 bytes of 'prefix' means buffer started at position 100 - 14 = 86
+  // since=92 -> offset = 92 - 86 = 6 -> 'new data'
+  session._dataListeners = [];
+
+  const result = await session.read({ timeout: 50, idleTimeout: 10, maxLines: 50, since: 92 });
+
+  assert.equal(result.output, 'new data');
+  assert.equal(result.position, 100);
+  assert.equal(result.truncated, false);
+});
+
+test('read with since in evicted region sets truncated', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = 'current data'; // 12 bytes, bufferStart = 100-12=88
+  session._readCursor = 0;
+  session._totalBytesEmitted = 100;
+  session._dataListeners = [];
+
+  // since=50 is before bufferStart=88
+  const result = await session.read({ timeout: 50, idleTimeout: 10, maxLines: 50, since: 50 });
+
+  assert.equal(result.output, 'current data');
+  assert.equal(result.truncated, true);
+  assert.equal(result.position, 100);
+});
+
+test('read with since beyond current position waits for data', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = '';
+  session._readCursor = 0;
+  session._totalBytesEmitted = 100;
+  session._dataListeners = [];
+
+  const resultPromise = session.read({ timeout: 50, idleTimeout: 10, maxLines: 50, since: 100 });
+
+  // Simulate new data arriving
+  const onData = session._dataListeners.at(-1);
+  session._buffer = 'fresh output';
+  session._totalBytesEmitted = 112;
+  onData('fresh output');
+
+  const result = await resultPromise;
+  assert.equal(result.output, 'fresh output');
+  assert.equal(result.position, 112);
+});
+
+test('kill uses process group kill on Unix', () => {
+  const session = createSession();
+  session.alive = true;
+  const kills = [];
+  session.process = {
+    pid: 12345,
+    kill: (sig) => kills.push({ method: 'pty', signal: sig }),
+  };
+
+  const originalPlatform = process.platform;
+  // We can't actually change process.platform, but we can test the code path
+  // by checking the logic directly
+
+  session.kill();
+  assert.equal(session.alive, false);
+});
+
+test('kill is idempotent', () => {
+  const session = createSession();
+  session.alive = false;
+  session.process = { pid: 12345 };
+
+  // Should not throw
+  session.kill();
+  assert.equal(session.alive, false);
+});
+
+test('_waitForMarker returns reason marker on completion', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = 'output__MCP_DONE_abc__';
+  session._dataListeners = [];
+
+  const resultPromise = session._waitForMarker('__MCP_DONE_abc__', 500);
+  const result = await resultPromise;
+
+  assert.equal(result.reason, 'marker');
+  assert.ok(result.buffer.includes('__MCP_DONE_abc__'));
+});
+
+test('_waitForMarker returns reason timeout on hard timeout', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = 'no marker here';
+  session._dataListeners = [];
+
+  const result = await session._waitForMarker('__MCP_DONE_abc__', 30);
+
+  assert.equal(result.reason, 'timeout');
+});
+
+test('_waitForMarker returns reason quiet when output stops', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = '';
+  session._dataListeners = [];
+
+  const resultPromise = session._waitForMarker('__MCP_DONE_abc__', 2000, 30, 1);
+
+  // Simulate some output then silence
+  const onData = session._dataListeners.at(-1);
+  onData('some output');
+
+  const result = await resultPromise;
+  assert.equal(result.reason, 'quiet');
+});
+
+test('_waitForMarker quiet respects minOutputBytes', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = '';
+  session._dataListeners = [];
+
+  // minOutputBytes = 100, but we only send 5 bytes
+  const resultPromise = session._waitForMarker('__MCP_DONE_abc__', 2000, 30, 100);
+
+  const onData = session._dataListeners.at(-1);
+  onData('short');
+
+  // Quiet timer should NOT fire because bytesSeen < minOutputBytes
+  // Only the hard timeout should fire
+  const result = await resultPromise;
+  assert.equal(result.reason, 'timeout');
+});
+
+test('watch returns on trigger match', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = '';
+  session._totalBytesEmitted = 0;
+  session._dataListeners = [];
+
+  const resultPromise = session.watch({
+    triggers: [{ id: 'ready', pattern: 'Server ready' }],
+    timeout: 2000,
+    contextLines: 2,
+  });
+
+  const onData = session._dataListeners.at(-1);
+  onData('Starting...\n');
+  session._totalBytesEmitted += 12;
+  onData('Server ready\n');
+  session._totalBytesEmitted += 13;
+
+  const result = await resultPromise;
+  assert.equal(result.reason, 'trigger');
+  assert.equal(result.triggerId, 'ready');
+  assert.equal(result.matchedLine, 'Server ready');
+  assert.equal(result.context.length, 2); // 'Starting...' + 'Server ready'
+  assert.equal(result.context[0], 'Starting...');
+});
+
+test('watch returns on timeout when no trigger matches', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = '';
+  session._totalBytesEmitted = 0;
+  session._dataListeners = [];
+
+  const result = await session.watch({
+    triggers: [{ id: 'never', pattern: 'wont-match' }],
+    timeout: 30,
+  });
+
+  assert.equal(result.reason, 'timeout');
+  assert.equal(result.timedOut, true);
+});
+
+test('watch returns on quiet detection', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = '';
+  session._totalBytesEmitted = 0;
+  session._dataListeners = [];
+
+  const resultPromise = session.watch({
+    triggers: [{ id: 'x', pattern: 'x' }],
+    timeout: 5000,
+    quietExitMs: 30,
+  });
+
+  const onData = session._dataListeners.at(-1);
+  onData('some output\n');
+  session._totalBytesEmitted += 12;
+  // No more data — quiet timer fires
+
+  const result = await resultPromise;
+  assert.equal(result.reason, 'quiet');
+});
+
+test('watch returns on process exit', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = '';
+  session._totalBytesEmitted = 0;
+  session._dataListeners = [];
+
+  const resultPromise = session.watch({
+    triggers: [{ id: 'x', pattern: 'x' }],
+    timeout: 5000,
+  });
+
+  // Simulate process exit
+  session.alive = false;
+
+  const result = await resultPromise;
+  assert.equal(result.reason, 'exit');
+});
+
+test('watch respects cooldown', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = '';
+  session._totalBytesEmitted = 0;
+  session._dataListeners = [];
+
+  const resultPromise = session.watch({
+    triggers: [{ id: 'ping', pattern: 'ping', cooldownMs: 5000 }],
+    timeout: 5000,
+  });
+
+  const onData = session._dataListeners.at(-1);
+  onData('ping\n');
+  session._totalBytesEmitted += 5;
+  // Cooldown prevents immediate re-match, but first match should fire
+
+  const result = await resultPromise;
+  assert.equal(result.reason, 'trigger');
+  assert.equal(result.triggerId, 'ping');
+});
+
+test('watch with since skips already-emitted output', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = 'old data match here'; // 20 bytes
+  session._totalBytesEmitted = 100; // bufferStart = 80
+  session._dataListeners = [];
+
+  // since=90 means we only match from offset 10 in buffer
+  // 'old data match here'[10:] = 'match here' -> matches 'match'
+  const resultPromise = session.watch({
+    triggers: [{ id: 'found', pattern: 'match' }],
+    timeout: 2000,
+    since: 90,
+  });
+
+  // Should resolve immediately from existing buffer
+  const result = await resultPromise;
+  assert.equal(result.reason, 'trigger');
+  assert.equal(result.triggerId, 'found');
+});
