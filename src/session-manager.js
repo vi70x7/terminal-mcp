@@ -1,25 +1,37 @@
-import { stat } from 'node:fs/promises';
-import { resolve as resolvePath } from 'node:path';
-import { platform } from 'node:os';
-import { PtySession } from './pty-session.js';
-import { detectShell, isAvailable } from './shell-detector.js';
-import { generateSessionId } from './session-id.js';
+import { stat } from "node:fs/promises";
+import { resolve as resolvePath } from "node:path";
+import { PtySession } from "./pty-session.js";
+import { detectShell, isAvailable } from "./shell-detector.js";
+import { generateSessionId } from "./session-id.js";
 
 const DEFAULT_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_SESSIONS = 10;
 const CLEANUP_INTERVAL_MS = 60 * 1000; // Check every minute
 const CWD_ERROR_MESSAGES = {
-  EACCES: 'Permission denied',
-  ENOENT: 'Path does not exist',
-  ENOTDIR: 'A component of the path is not a directory',
+  EACCES: "Permission denied",
+  ENOENT: "Path does not exist",
+  ENOTDIR: "A component of the path is not a directory",
 };
 
 export class SessionManager {
-  constructor({ SessionClass = PtySession } = {}) {
+  /**
+   * @param {object} opts
+   * @param {import('./ptyd-client.js').PtydClient} opts.ptydClient - Client for the ptyd daemon
+   * @param {typeof PtySession} [opts.SessionClass=PtySession]
+   */
+  constructor({ ptydClient, SessionClass = PtySession } = {}) {
+    if (!ptydClient) {
+      throw new Error("SessionManager requires a ptydClient instance");
+    }
+    /** @type {import('./ptyd-client.js').PtydClient} */
+    this._ptydClient = ptydClient;
     /** @type {Map<string, PtySession>} */
     this._sessions = new Map();
     this._SessionClass = SessionClass;
-    this._cleanupTimer = setInterval(() => this._cleanupExpired(), CLEANUP_INTERVAL_MS);
+    this._cleanupTimer = setInterval(
+      () => this._cleanupExpired(),
+      CLEANUP_INTERVAL_MS,
+    );
     // Don't keep process alive just for cleanup
     this._cleanupTimer.unref();
   }
@@ -37,7 +49,9 @@ export class SessionManager {
    */
   async create({ shell, cols = 120, rows = 30, cwd, name, env } = {}) {
     if (this._sessions.size >= MAX_SESSIONS) {
-      throw new Error(`Maximum ${MAX_SESSIONS} concurrent sessions reached. Stop an existing session first.`);
+      throw new Error(
+        `Maximum ${MAX_SESSIONS} concurrent sessions reached. Stop an existing session first.`,
+      );
     }
 
     const resolvedCwd = await resolveSessionCwd(cwd);
@@ -47,6 +61,7 @@ export class SessionManager {
 
     const id = generateSessionId(new Set(this._sessions.keys()));
     const session = new this._SessionClass({
+      ptydClient: this._ptydClient,
       id,
       shell: resolvedShell,
       shellArgs,
@@ -69,7 +84,9 @@ export class SessionManager {
   get(id) {
     const session = this._sessions.get(id);
     if (!session) {
-      throw new Error(`Session "${id}" not found. Use terminal_list to see active sessions.`);
+      throw new Error(
+        `Session "${id}" not found. Use terminal_list to see active sessions.`,
+      );
     }
     return session;
   }
@@ -93,7 +110,9 @@ export class SessionManager {
    * @returns {object[]}
    */
   list({ verbose = true } = {}) {
-    return Array.from(this._sessions.values()).map((session) => session.getInfo({ verbose }));
+    return Array.from(this._sessions.values()).map((session) =>
+      session.getInfo({ verbose }),
+    );
   }
 
   /**
@@ -105,6 +124,9 @@ export class SessionManager {
     }
     this._sessions.clear();
     clearInterval(this._cleanupTimer);
+    if (this._ptydClient && typeof this._ptydClient.shutdown === "function") {
+      this._ptydClient.shutdown().catch(() => {});
+    }
   }
 
   /**
@@ -122,29 +144,18 @@ export class SessionManager {
   }
 }
 
-const WINDOWS_SHELL_EXTENSIONS = ['.exe', '.cmd', '.bat'];
-
 /**
  * Validate and resolve a user-provided shell name.
- * On Windows, tries appending common extensions if the bare name isn't found.
  * @param {string} shell
  * @returns {string} The resolved shell name
  */
 function resolveUserShell(shell) {
   if (isAvailable(shell)) return shell;
 
-  // On Windows, try appending .exe etc. so "pwsh" resolves to "pwsh.exe"
-  if (platform() === 'win32' && !shell.includes('.')) {
-    for (const ext of WINDOWS_SHELL_EXTENSIONS) {
-      const candidate = `${shell}${ext}`;
-      if (isAvailable(candidate)) return candidate;
-    }
-  }
-
   const detected = detectShell();
   throw new Error(
     `Shell "${shell}" not found. The auto-detected shell is "${detected.shell}". ` +
-    'Omit the shell parameter to use auto-detection, or provide the full path to the shell executable.',
+      "Omit the shell parameter to use auto-detection, or provide the full path to the shell executable.",
   );
 }
 
